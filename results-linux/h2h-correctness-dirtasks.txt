@@ -1,0 +1,6 @@
+literal PM_RESUME: ffs=38 rg=38 MATCH
+literal ERR_PTR: ffs=17569 rg=17569 MATCH
+literal zqxjvkwqz: ffs=0 rg=0 MATCH
+regex PM_[A-Z_]+: ffs=114746 rg=114746 MATCH
+regex [0-9a-f]{16}: ffs=17005 rg=17005 MATCH
+regex \w+_lock_irqsave\(: ffs=16957 rg=16957 MATCH

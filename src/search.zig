@@ -27,15 +27,23 @@ pub const Options = struct {
 
 /// The default thread count: the number of performance cores
 /// (`hw.perflevel0.logicalcpu`) on Apple silicon, where more threads mostly
-/// add kernel contention (EXPERIMENTS.md, Experiment 7). Elsewhere, and on
-/// Intel Macs, 4 capped at the CPU count.
+/// add kernel contention (EXPERIMENTS.md, Experiment 7). Elsewhere, every
+/// logical CPU.
+///
+/// The old fallback was 4 everywhere, a number measured on Apple silicon: on
+/// a 16-thread Linux box that cost 1.74x on the kernel fixture, because the
+/// search keeps scaling well past 4 threads there (Experiment 15). 16 is the
+/// widest machine measured, and it was still the fastest setting on the large
+/// fixture; above that this is untested. Small trees peak a little earlier
+/// (redis: 4.1 ms at `-j8` vs 5.4 ms at `-j16`), which is 1.3 ms, so the
+/// large-tree setting wins the tradeoff.
 pub fn autoJobs() usize {
     if (builtin.os.tag == .macos) {
         var n: c_int = 0;
         var len: usize = @sizeOf(c_int);
         if (std.c.sysctlbyname("hw.perflevel0.logicalcpu", &n, &len, null, 0) == 0 and n > 0) return @intCast(n);
     }
-    return @min(4, std.Thread.getCpuCount() catch 1);
+    return std.Thread.getCpuCount() catch 4;
 }
 
 pub const Output = union(enum) {
@@ -76,7 +84,7 @@ pub fn run(gpa: std.mem.Allocator, opts: Options, output: Output) !void {
         .callback => undefined,
     };
     var searcher: Searcher = .{ .io = io, .gpa = gpa, .opts = opts, .output = output, .writer = &file_writer.interface };
-    try walk.walk(io, gpa, root, &searcher);
+    try walk.walk(io, gpa, root, &searcher, opts.jobs);
     if (output == .print) try file_writer.interface.flush();
 }
 
@@ -91,7 +99,7 @@ pub const Searcher = struct {
 
     pub const read_size = 256 * 1024;
 
-    /// Per-directory-task state, reused for every file in the directory.
+    /// Per-worker state, reused for every file that worker visits.
     pub const Local = struct {
         buf: []u8, // read buffer; grows only for lines longer than read_size
         matches: Io.Writer.Allocating, // current file's output (`.print`) or line texts (`.callback`)

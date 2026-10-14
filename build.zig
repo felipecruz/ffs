@@ -36,6 +36,12 @@ pub fn build(b: *std.Build) void {
     }
 
     // The C library: src/c_api.zig behind include/ffs.h.
+    //
+    // `link_libc` is required, not a preference: without it the library
+    // brings its own threading runtime into a host program that already has
+    // libc's, and on Linux `ffs_search` then hangs forever on the first
+    // search, at any thread count (EXPERIMENTS.md, Experiment 15). macOS
+    // needed libc here anyway, for `sysctlbyname` in `search.autoJobs`.
     const lib = b.addLibrary(.{
         .name = "ffs",
         .linkage = .static,
@@ -43,6 +49,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/c_api.zig"),
             .target = target,
             .optimize = .ReleaseFast,
+            .link_libc = true,
         }),
     });
     lib.root_module.addOptions("build_options", options);

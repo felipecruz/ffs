@@ -12,14 +12,14 @@ const Regex = @import("regex.zig").Regex;
 // Layers:
 //   main.zig    command line
 //   c_api.zig   the same search as a C library (include/ffs.h)
-//   walk.zig    parallel recursive directory walk (one task per directory)
+//   walk.zig    parallel recursive directory walk (worker pool, one queue)
 //   search.zig  thread pool, per-file work: open, read, binary check, output
 //   match.zig   finding the term in bytes (SIMD), no I/O
 //   regex.zig   regex: parser, Pike VM, SIMD literal prefilter
 //
 // `-j N` sets the number of worker threads; `-j 1` is fully serial. The
 // default, `-j auto`, is the performance-core count on Apple silicon (4 on
-// an M5), else 4: see `search.autoJobs`.
+// an M5), else every logical CPU: see `search.autoJobs`.
 //
 // std.Io.Evented (Dispatch on macOS) and std.Io.Kqueue do not compile in
 // Zig 0.17.0: their vtables are out of sync with std.Io.VTable.
@@ -89,7 +89,8 @@ fn usage() noreturn {
     std.debug.print(
         \\usage: ffs [-j N|auto] [-i] [-E] [--content] <folder> <term>
         \\  -j N|auto          worker threads (default: auto = {d} here, the
-        \\                     performance-core count on Apple silicon, else 4)
+        \\                     performance-core count on Apple silicon, else
+        \\                     every logical CPU)
         \\  -i, --ignore-case  match ASCII letters regardless of case
         \\  -E, --regex        <term> is a regular expression (see src/regex.zig)
         \\  --content          print <path>:<line>:<content> instead of <path>:<line>
