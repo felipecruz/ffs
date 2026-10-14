@@ -22,7 +22,9 @@ Omarchy/Arch): see EXPERIMENTS.md, Experiment 15.
   test, a C library smoke test (with a timeout, so the hang above cannot
   come back unnoticed) and a version-consistency check on Linux and macOS,
   cross-compiles all six targets, and publishes a `kcov` line-coverage
-  report for `src/`. `release.yml` builds every target on a tag and attaches
+  report for `src/`, posted on each pull request as a per-file table (one
+  comment, edited in place) and kept as an HTML artifact.
+  `release.yml` builds every target on a tag and attaches
   the archives, with the CHANGELOG section as the release notes. New
   `zig build test-bin` builds the test binary without running it, for the
   coverage tool.

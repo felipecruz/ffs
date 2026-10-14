@@ -102,6 +102,9 @@ jobs:
   coverage:
     name: coverage
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write # the coverage comment, nothing else
     env:
       # Job-level so the Codecov step's `if` can read it; empty when unset.
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
@@ -150,40 +153,42 @@ jobs:
       - name: What kcov wrote
         run: find coverage -maxdepth 2 | sort
 
-      - name: Summarize
-        # Reporting must never be what fails the job: the coverage run above
-        # already passed or failed on its own.
+      - name: Build the coverage report
+        # Reporting must never be what fails the job: the kcov run above
+        # already passed or failed on its own merits.
         continue-on-error: true
-        shell: bash
         run: |
           set -uo pipefail
-          json=$(find coverage -name 'coverage.json' | head -1)
-          echo "kcov json: $json"
-          python3 - "$json" >> "$GITHUB_STEP_SUMMARY" <<'PY'
-          import json, sys
+          json=$(find coverage -name coverage.json | head -1)
+          python3 .github/scripts/kcov_report.py "$json" \
+            --title "Line coverage: src/ (kcov)" > coverage-report.md
+          cat coverage-report.md >> "$GITHUB_STEP_SUMMARY"
+          cat coverage-report.md
 
-          d = json.load(open(sys.argv[1]))
-          files = d.get("files", [])
-
-          def num(x, default=0.0):
-              try:
-                  return float(x)
-              except (TypeError, ValueError):
-                  return default
-
-          covered = sum(num(f.get("covered_lines")) for f in files)
-          total = sum(num(f.get("total_lines")) for f in files)
-          pct = num(d.get("percent_covered"), (covered / total * 100) if total else 0.0)
-
-          print(f"### Line coverage: {pct:.1f}%  ({covered:.0f}/{total:.0f} lines in src/, kcov)")
-          print()
-          print("| File | Covered | Total | % |")
-          print("|---|---:|---:|---:|")
-          for f in sorted(files, key=lambda f: f.get("file", "")):
-              name = f.get("file", "?").split("/src/")[-1]
-              c, t = num(f.get("covered_lines")), num(f.get("total_lines"))
-              print(f'| `{name}` | {c:.0f} | {t:.0f} | {num(f.get("percent_covered"), (c/t*100) if t else 0):.1f}% |')
-          PY
+      - name: Comment the report on the pull request
+        # Same-repo pull requests only: a fork's GITHUB_TOKEN is read-only, so
+        # commenting would fail and the job summary is the fallback there.
+        if: >-
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          MARKER: '<!-- ffs-coverage-report -->'
+        run: |
+          set -uo pipefail
+          body=$(cat coverage-report.md)
+          # One comment per pull request, edited in place on later pushes.
+          existing=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments?per_page=100" \
+            | python3 -c 'import json,os,sys; m=os.environ["MARKER"]; print(next((str(c["id"]) for c in json.load(sys.stdin) if m in (c.get("body") or "")), ""))')
+          if [ -n "$existing" ]; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$existing" \
+              -f body="$body" >/dev/null && echo "updated comment $existing"
+          else
+            gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$PR/comments" \
+              -f body="$body" >/dev/null && echo "created the coverage comment"
+          fi
 
       - uses: actions/upload-artifact@v4
         with:

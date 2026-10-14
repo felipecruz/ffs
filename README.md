@@ -154,9 +154,10 @@ both codebases. Output is identical except for one case: a file with a NUL
 byte late in it, which ripgrep partly prints and ffs skips.
 
 CI (GitHub Actions) runs the tests on Linux and macOS, checks `zig fmt`,
-smoke-tests the CLI and the C library, cross-compiles all six targets, and
-publishes a line-coverage report for `src/` as a build artifact
-(`kcov`, since Zig has no coverage of its own).
+smoke-tests the CLI and the C library, and cross-compiles all six targets.
+Line coverage for `src/` is measured with `kcov` (Zig has no coverage of its
+own) and posted on each pull request as a per-file table, with the HTML
+report kept as a build artifact.
 
 `bench/h2h.sh` re-checks that on every run: ffs and ripgrep report identical
 match counts for three literals and three regexes on the kernel source
