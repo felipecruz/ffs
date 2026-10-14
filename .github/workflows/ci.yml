@@ -44,11 +44,16 @@ jobs:
         run: |
           set -euo pipefail
           ffs=zig-out/release/ffs
-          # A term that exists, one that does not, and the three flags.
+          # A term that exists, and the three flags. The "no match" term is
+          # built at runtime: any literal spelled out here would be found in
+          # this very repository if the search ever looked at .github/.
+          absent="zz$(printf %s no_such_term)zz"
           [ "$($ffs src findLines | wc -l)" -gt 0 ]
-          [ "$($ffs src zqxjvkwqz | wc -l)" -eq 0 ]
+          [ "$($ffs src "$absent" | wc -l)" -eq 0 ]
           [ "$($ffs -i src FINDLINES | wc -l)" -gt 0 ]
           [ "$($ffs -E src 'find[A-Z][a-z]+' | wc -l)" -gt 0 ]
+          # No `| head`: ffs would take SIGPIPE and fail the pipeline under
+          # pipefail. `grep -E` because BSD grep (macOS) has no BRE \+.
           content=$($ffs --content src findLines)
           grep -Eq 'src/.*:[0-9]+:' <<<"$content"
           # -j 1 and -j auto must find exactly the same lines.
@@ -72,7 +77,8 @@ jobs:
           set -euo pipefail
           v=$(sed -n 's/^const version = "\(.*\)";$/\1/p' build.zig)
           echo "build.zig: $v"
-          [ "$(zig-out/release/ffs --version)" = "ffs $v" ]
+          # --version goes to stderr (std.debug.print, src/main.zig), so 2>&1.
+          [ "$(zig-out/release/ffs --version 2>&1)" = "ffs $v" ]
           grep -q "^## $v" CHANGELOG.md
 
   cross:
