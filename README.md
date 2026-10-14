@@ -1,11 +1,16 @@
 # ffs
 
-**A file searcher in about 560 lines of Zig that keeps pace with ripgrep.**
-(1,050 with the optional regex engine and C library.)
+**A file searcher in about 560 lines of Zig that keeps pace with ripgrep** —
+and is ahead of it on every literal search on Linux, at every thread count.
+(1,050 lines with the optional regex engine and C library.)
 
 No dependencies, no clever tricks. Just two ideas, done carefully:
 
 1. **Threads:** a worker pool over one queue of directories and file batches.
+   Any free worker takes the next item, so one directory with 4,000 files in
+   it cannot pin the thread that found it. Handing files to another worker
+   costs a copy of their names, so a worker only pays that while another
+   worker is idle.
 2. **SIMD:** compare 16 bytes at a time, counting line numbers in the same pass.
 
 ## Results
@@ -33,6 +38,15 @@ where both tools use every core:
 | Regex with no literal `[0-9a-f]{16}` | 1,361 ms | **281 ms** | — |
 | Redis (25 MB), 37,000 matching lines | **5.4 ms** | 6.5 ms | — |
 
+Both tools held to the same thread count on that Linux box, searching the
+kernel tree for `PM_RESUME` — this is what the worker pool bought
+(`bench/h2h.sh`):
+
+| Threads | 1 | 2 | 4 | 8 | 12 | 16 |
+|:---|---:|---:|---:|---:|---:|---:|
+| **ffs** | **580 ms** | **299** | **154** | **88** | **80** | **76** |
+| ripgrep | 898 ms | 372 | 191 | 106 | 90 | 80 |
+
 | | **ffs** | ripgrep | grep |
 |:---|---:|---:|---:|
 | Memory (kernel-tree search) | **7–9 MB** at `-j4`, 12 MB at `-j16` | 10–20 MB | 3 MB |
@@ -45,6 +59,9 @@ where both tools use every core:
   the kernel. On Linux, where threads do keep paying off, ffs is ahead of
   ripgrep at *every* thread count, from 1 to 16 (EXPERIMENTS.md,
   Experiment 15).
+- **Scales 7.6× on 16 threads** (580 → 76 ms), against 5.0× before the work
+  queue landed. ripgrep scales further (10.5×) but starts from a slower
+  single-threaded time, so ffs stays ahead the whole way.
 - **About 95% of the time is the kernel** opening and reading files. The
   search itself is no longer the bottleneck.
 - **Where ripgrep wins:** regexes with no fixed text in them — 1.4× on
@@ -131,6 +148,14 @@ ffs_search("src", "TODO", FFS_IGNORE_CASE, 0, on_match, NULL);
 Every feature was also compared with ripgrep's output, byte for byte, on
 both codebases. Output is identical except for one case: a file with a NUL
 byte late in it, which ripgrep partly prints and ffs skips.
+
+`bench/h2h.sh` re-checks that on every run: ffs and ripgrep report identical
+match counts for three literals and three regexes on the kernel tree (38,
+17,569, 0, 114,746, 17,005 and 16,957 lines), so a speed number can never
+come from work that was skipped. `zig build c-example` links the static
+library and reports the same count as the CLI on Linux too — it used to hang
+there forever, because `libffs.a` was built without libc
+(EXPERIMENTS.md, Experiment 15).
 
 ## More
 
