@@ -1,5 +1,7 @@
 # ffs
 
+[![CI](https://github.com/felipecruz/ffs/actions/workflows/ci.yml/badge.svg)](https://github.com/felipecruz/ffs/actions/workflows/ci.yml)
+
 **A file searcher in about 560 lines of Zig that keeps pace with ripgrep** —
 and on a Linux machine it is ahead of ripgrep at every thread count, on the
 Linux kernel source dataset (1.9 GB, 92,000 files).
@@ -150,6 +152,11 @@ ffs_search("src", "TODO", FFS_IGNORE_CASE, 0, on_match, NULL);
 Every feature was also compared with ripgrep's output, byte for byte, on
 both codebases. Output is identical except for one case: a file with a NUL
 byte late in it, which ripgrep partly prints and ffs skips.
+
+CI (GitHub Actions) runs the tests on Linux and macOS, checks `zig fmt`,
+smoke-tests the CLI and the C library, cross-compiles all six targets, and
+publishes a line-coverage report for `src/` as a build artifact
+(`kcov`, since Zig has no coverage of its own).
 
 `bench/h2h.sh` re-checks that on every run: ffs and ripgrep report identical
 match counts for three literals and three regexes on the kernel source

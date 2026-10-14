@@ -1,0 +1,121 @@
+name: Release
+
+# Tagging `v0.0.9` builds every target from one Linux runner (Zig
+# cross-compiles) and attaches the archives to a GitHub release. The release
+# notes are the matching CHANGELOG section, so the tag, build.zig and the
+# CHANGELOG have to agree — the first job fails if they do not.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  ZIG_VERSION: 0.17.0
+
+jobs:
+  check:
+    name: tag matches the code
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^const version = "\(.*\)";$/\1/p' build.zig)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "build.zig says $version"
+          if [ "${GITHUB_REF_TYPE:-}" = tag ]; then
+            [ "$GITHUB_REF_NAME" = "v$version" ] || {
+              echo "::error::tag $GITHUB_REF_NAME does not match build.zig version $version"
+              exit 1
+            }
+          fi
+          grep -q "^## $version" CHANGELOG.md || {
+            echo "::error::CHANGELOG.md has no '## $version' section"
+            exit 1
+          }
+
+  build:
+    name: ${{ matrix.target }}
+    needs: check
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-linux-gnu
+          - x86_64-linux-musl
+          - aarch64-linux-gnu
+          - x86_64-macos
+          - aarch64-macos
+          - x86_64-windows
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Build
+        run: zig build -Dtarget=${{ matrix.target }} -p dist
+
+      - name: Package
+        id: pkg
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="ffs-${{ needs.check.outputs.version }}-${{ matrix.target }}"
+          mkdir -p "out/$name"
+          # The CLI, the C library and its header; debug builds are not shipped.
+          cp dist/release/ffs* "out/$name/"
+          cp dist/include/ffs.h "out/$name/"
+          cp dist/lib/* "out/$name/"
+          cp README.md CHANGELOG.md "out/$name/"
+          cd out
+          case "${{ matrix.target }}" in
+            *windows) zip -qr "$name.zip" "$name"; echo "asset=out/$name.zip" >> "$GITHUB_OUTPUT" ;;
+            *)        tar -czf "$name.tar.gz" "$name"; echo "asset=out/$name.tar.gz" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ffs-${{ matrix.target }}
+          path: ${{ steps.pkg.outputs.asset }}
+          if-no-files-found: error
+
+  release:
+    name: publish
+    needs: [check, build]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+
+      - name: Checksums and notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd assets && sha256sum * > SHA256SUMS && cd ..
+          # The CHANGELOG section for this version becomes the release body.
+          awk -v v="${{ needs.check.outputs.version }}" '
+            $0 ~ "^## " v { inside = 1; next }
+            /^## / && inside { exit }
+            inside { print }
+          ' CHANGELOG.md > notes.md
+          echo "--- notes.md ---" && cat notes.md
+          ls -la assets
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          body_path: notes.md
+          files: assets/*
+          fail_on_unmatched_files: true

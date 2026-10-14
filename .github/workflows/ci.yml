@@ -1,0 +1,167 @@
+name: CI
+
+on:
+  push:
+    branches: [main, 'feature/**']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  ZIG_VERSION: 0.17.0
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-latest is Apple silicon, which is the only place the
+        # `hw.perflevel0.logicalcpu` path in search.autoJobs runs.
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: zig fmt
+        if: matrix.os == 'ubuntu-latest'
+        run: zig fmt --check build.zig src/*.zig
+
+      - name: Build (debug, release, C library)
+        run: zig build
+
+      - name: Tests
+        run: zig build test
+
+      - name: CLI smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          ffs=zig-out/release/ffs
+          # A term that exists, one that does not, and the three flags.
+          [ "$($ffs src findLines | wc -l)" -gt 0 ]
+          [ "$($ffs src zqxjvkwqz | wc -l)" -eq 0 ]
+          [ "$($ffs -i src FINDLINES | wc -l)" -gt 0 ]
+          [ "$($ffs -E src 'find[A-Z][a-z]+' | wc -l)" -gt 0 ]
+          $ffs --content src findLines | head -1 | grep -q 'src/.*:[0-9]\+:'
+          # -j 1 and -j auto must find exactly the same lines.
+          diff <($ffs -j1 src findLines | sort) <($ffs src findLines | sort)
+          $ffs --version
+
+      - name: C library smoke test
+        # Guards the Linux-only hang fixed in 0.0.9: libffs.a without libc
+        # made ffs_search block forever, so a timeout is the assertion.
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          out=$(zig build c-example -- src findLines | tail -1)
+          echo "$out"
+          echo "$out" | grep -qE '^[1-9][0-9]* matching lines'
+
+      - name: Version is consistent across build.zig, the CLI and the CHANGELOG
+        shell: bash
+        run: |
+          set -euo pipefail
+          v=$(sed -n 's/^const version = "\(.*\)";$/\1/p' build.zig)
+          echo "build.zig: $v"
+          [ "$(zig-out/release/ffs --version)" = "ffs $v" ]
+          grep -q "^## $v" CHANGELOG.md
+
+  cross:
+    name: cross-compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Build every target the README claims
+        run: |
+          set -euo pipefail
+          for t in x86_64-linux-gnu x86_64-linux-musl aarch64-linux-gnu \
+                   x86_64-macos aarch64-macos x86_64-windows; do
+            echo "::group::$t"
+            zig build -Dtarget="$t"
+            echo "::endgroup::"
+          done
+
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    env:
+      # Job-level so the Codecov step's `if` can read it; empty when unset.
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Install kcov
+        run: sudo apt-get update && sudo apt-get install -y kcov
+
+      - name: Build the test binary
+        run: zig build test-bin
+
+      - name: Run tests under kcov
+        # Zig has no coverage instrumentation, so kcov reads DWARF from the
+        # debug test binary. Only src/ counts; the std library is excluded.
+        run: |
+          set -euo pipefail
+          kcov --include-pattern=/src/ --exclude-pattern=/test/,/lib/std/ \
+            coverage zig-out/test/test
+
+      - name: Summarize
+        # Reporting must never be what fails the job: the coverage run above
+        # already passed or failed on its own.
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -uo pipefail
+          json=$(find coverage -name 'coverage.json' | head -1)
+          echo "kcov json: $json"
+          python3 - "$json" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json, sys
+
+          d = json.load(open(sys.argv[1]))
+          files = d.get("files", [])
+
+          def num(x, default=0.0):
+              try:
+                  return float(x)
+              except (TypeError, ValueError):
+                  return default
+
+          covered = sum(num(f.get("covered_lines")) for f in files)
+          total = sum(num(f.get("total_lines")) for f in files)
+          pct = num(d.get("percent_covered"), (covered / total * 100) if total else 0.0)
+
+          print(f"### Line coverage: {pct:.1f}%  ({covered:.0f}/{total:.0f} lines in src/, kcov)")
+          print()
+          print("| File | Covered | Total | % |")
+          print("|---|---:|---:|---:|")
+          for f in sorted(files, key=lambda f: f.get("file", "")):
+              name = f.get("file", "?").split("/src/")[-1]
+              c, t = num(f.get("covered_lines")), num(f.get("total_lines"))
+              print(f'| `{name}` | {c:.0f} | {t:.0f} | {num(f.get("percent_covered"), (c/t*100) if t else 0):.1f}% |')
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: coverage
+          retention-days: 14
+
+      # Optional: only runs once a CODECOV_TOKEN secret exists. Without it the
+      # HTML artifact and the job summary above are the whole story.
+      - name: Upload to Codecov
+        if: env.CODECOV_TOKEN != ''
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage/test/cobertura.xml
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false

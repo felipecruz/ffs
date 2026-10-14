@@ -18,6 +18,14 @@ Omarchy/Arch): see EXPERIMENTS.md, Experiment 15.
   count. `libffs.a` was built without `link_libc`, so it brought its own
   threading runtime into a host program that already had libc's. Present in
   0.0.8; never seen because the C example had only ever been run on macOS.
+- CI/CD on GitHub Actions: `ci.yml` runs `zig fmt`, the tests, a CLI smoke
+  test, a C library smoke test (with a timeout, so the hang above cannot
+  come back unnoticed) and a version-consistency check on Linux and macOS,
+  cross-compiles all six targets, and publishes a `kcov` line-coverage
+  report for `src/`. `release.yml` builds every target on a tag and attaches
+  the archives, with the CHANGELOG section as the release notes. New
+  `zig build test-bin` builds the test binary without running it, for the
+  coverage tool.
 - Benchmark scripts find their tools through `bench/tools.sh` (`RG`, `ACK`,
   `GREP`, `HYPERFINE`, `FFS`, `OUT` all overridable) instead of hardcoded
   Homebrew paths, skip `ack` when it is not installed, and read the CPU

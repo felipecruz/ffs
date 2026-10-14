@@ -95,4 +95,12 @@ pub fn build(b: *std.Build) void {
     tests.root_module.addOptions("build_options", options);
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);
+
+    // `zig build test-bin` writes the test binary to zig-out/test/ instead of
+    // running it, so a coverage tool can drive it (kcov in CI; Zig has no
+    // coverage of its own). The binary keeps debug info, which kcov needs.
+    const test_bin = b.addInstallArtifact(tests, .{
+        .dest_dir = .{ .override = .{ .custom = "test" } },
+    });
+    b.step("test-bin", "Build the test binary without running it").dependOn(&test_bin.step);
 }
