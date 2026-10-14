@@ -38,11 +38,12 @@ typedef int (*ffs_callback)(void *ctx, const ffs_match *m);
 
 /* Searches every text file under `root` (recursively, nothing ignored,
  * binary files skipped) for lines containing `term`. `threads` = 0 means
- * automatic: the performance-core count on Apple silicon, else 4. Blocks until done. */
+ * automatic: the performance-core count on Apple silicon, else every logical
+ * CPU. Blocks until done. */
 int ffs_search(const char *root, const char *term, unsigned flags,
                unsigned threads, ffs_callback cb, void *ctx);
 
-/* The library version, e.g. "0.0.8". */
+/* The library version, e.g. "0.0.9". */
 const char *ffs_version(void);
 
 #ifdef __cplusplus

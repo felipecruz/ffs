@@ -1,7 +1,7 @@
 const std = @import("std");
 
 /// The release version: `ffs --version` and `ffs_version()` in C.
-const version = "0.0.8";
+const version = "0.0.9";
 
 // `zig build` produces:
 //   zig-out/debug/ffs     (Debug: safety checks, debug info)
@@ -36,6 +36,12 @@ pub fn build(b: *std.Build) void {
     }
 
     // The C library: src/c_api.zig behind include/ffs.h.
+    //
+    // `link_libc` is required, not a preference: without it the library
+    // brings its own threading runtime into a host program that already has
+    // libc's, and on Linux `ffs_search` then hangs forever on the first
+    // search, at any thread count (EXPERIMENTS.md, Experiment 15). macOS
+    // needed libc here anyway, for `sysctlbyname` in `search.autoJobs`.
     const lib = b.addLibrary(.{
         .name = "ffs",
         .linkage = .static,
@@ -43,6 +49,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/c_api.zig"),
             .target = target,
             .optimize = .ReleaseFast,
+            .link_libc = true,
         }),
     });
     lib.root_module.addOptions("build_options", options);
@@ -88,4 +95,12 @@ pub fn build(b: *std.Build) void {
     tests.root_module.addOptions("build_options", options);
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);
+
+    // `zig build test-bin` writes the test binary to zig-out/test/ instead of
+    // running it, so a coverage tool can drive it (kcov in CI; Zig has no
+    // coverage of its own). The binary keeps debug info, which kcov needs.
+    const test_bin = b.addInstallArtifact(tests, .{
+        .dest_dir = .{ .override = .{ .custom = "test" } },
+    });
+    b.step("test-bin", "Build the test binary without running it").dependOn(&test_bin.step);
 }

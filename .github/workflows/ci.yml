@@ -1,0 +1,236 @@
+name: CI
+
+on:
+  push:
+    branches: [main, 'feature/**']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ZIG_VERSION: 0.17.0
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-latest is Apple silicon, which is the only place the
+        # `hw.perflevel0.logicalcpu` path in search.autoJobs runs.
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: zig fmt
+        if: matrix.os == 'ubuntu-latest'
+        run: zig fmt --check build.zig src/*.zig
+
+      - name: Build (debug, release, C library)
+        run: zig build
+
+      - name: Tests
+        run: zig build test
+
+      - name: CLI smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          ffs=zig-out/release/ffs
+          # A term that exists, and the three flags. The "no match" term is
+          # built at runtime: any literal spelled out here would be found in
+          # this very repository if the search ever looked at .github/.
+          absent="zz$(printf %s no_such_term)zz"
+          [ "$($ffs src findLines | wc -l)" -gt 0 ]
+          [ "$($ffs src "$absent" | wc -l)" -eq 0 ]
+          [ "$($ffs -i src FINDLINES | wc -l)" -gt 0 ]
+          [ "$($ffs -E src 'find[A-Z][a-z]+' | wc -l)" -gt 0 ]
+          # No `| head`: ffs would take SIGPIPE and fail the pipeline under
+          # pipefail. `grep -E` because BSD grep (macOS) has no BRE \+.
+          content=$($ffs --content src findLines)
+          grep -Eq 'src/.*:[0-9]+:' <<<"$content"
+          # -j 1 and -j auto must find exactly the same lines.
+          diff <($ffs -j1 src findLines | sort) <($ffs src findLines | sort)
+          $ffs --version
+
+      - name: C library smoke test
+        # Guards the Linux-only hang fixed in 0.0.9: libffs.a without libc
+        # made ffs_search block forever, so a timeout is the assertion.
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          out=$(zig build c-example -- src findLines | tail -1)
+          echo "$out"
+          echo "$out" | grep -qE '^[1-9][0-9]* matching lines'
+
+      - name: Version is consistent across build.zig, the CLI and the CHANGELOG
+        shell: bash
+        run: |
+          set -euo pipefail
+          v=$(sed -n 's/^const version = "\(.*\)";$/\1/p' build.zig)
+          echo "build.zig: $v"
+          # --version goes to stderr (std.debug.print, src/main.zig), so 2>&1.
+          [ "$(zig-out/release/ffs --version 2>&1)" = "ffs $v" ]
+          grep -q "^## $v" CHANGELOG.md
+
+  cross:
+    name: cross-compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Build every target the README claims
+        run: |
+          set -euo pipefail
+          for t in x86_64-linux-gnu x86_64-linux-musl aarch64-linux-gnu \
+                   x86_64-macos aarch64-macos x86_64-windows; do
+            echo "::group::$t"
+            zig build -Dtarget="$t"
+            echo "::endgroup::"
+          done
+
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write # the coverage comment, nothing else
+    env:
+      # Job-level so the Codecov step's `if` can read it; empty when unset.
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Install kcov
+        # kcov is no longer packaged for current Ubuntu runners ("Unable to
+        # locate package kcov"), so try apt first and otherwise build it. The
+        # dependency list is kcov's own; the tag is pinned, with the default
+        # branch as a fallback so a missing tag cannot break the job.
+        env:
+          KCOV_VERSION: v43
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          if sudo apt-get install -y kcov; then
+            kcov --version
+            exit 0
+          fi
+          echo "::notice::kcov not in apt; building $KCOV_VERSION from source"
+          sudo apt-get install -y \
+            build-essential cmake binutils-dev libcurl4-openssl-dev \
+            zlib1g-dev libdw-dev libiberty-dev
+          git clone --depth 1 --branch "$KCOV_VERSION" https://github.com/SimonKagstrom/kcov.git /tmp/kcov \
+            || git clone --depth 1 https://github.com/SimonKagstrom/kcov.git /tmp/kcov
+          cmake -S /tmp/kcov -B /tmp/kcov/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local
+          cmake --build /tmp/kcov/build --parallel "$(nproc)"
+          sudo cmake --install /tmp/kcov/build
+          kcov --version
+
+      - name: Build the test binary
+        run: zig build test-bin
+
+      - name: Run tests under kcov
+        # Zig has no coverage instrumentation, so kcov reads DWARF from the
+        # debug test binary. The include pattern has no leading slash so it
+        # matches both shapes kcov reports: the DWARF line table holds
+        # absolute paths (/home/runner/work/ffs/ffs/src/walk.zig) while its
+        # Cobertura output writes them relative to <source> (src/walk.zig).
+        run: |
+          set -euo pipefail
+          kcov --include-pattern=src/ --exclude-pattern=/lib/std/,/zig/lib/ \
+            coverage zig-out/test/test
+
+      - name: What kcov wrote
+        # Printed every run: when coverage comes out empty, the paths kcov
+        # actually recorded are the only thing that explains why.
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          find coverage -maxdepth 3 | sort
+          for xml in $(find coverage -name cobertura.xml); do
+            echo "--- $xml (first filenames)"
+            grep -o 'filename="[^"]*"' "$xml" | head -10 || true
+          done
+          for json in $(find coverage -name coverage.json); do
+            echo "--- $json"
+            python3 - "$json" <<'PY'
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          files = d.get("files", [])
+          print(f"  files recorded: {len(files)}")
+          for f in files[:20]:
+              print(f"    {f.get('file')}  ({f.get('covered_lines')}/{f.get('total_lines')})")
+          PY
+          done
+
+      - name: Build the coverage report
+        # Reporting must never be what fails the job: the kcov run above
+        # already passed or failed on its own merits.
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          # Cobertura first: fixed schema, and written per binary and per
+          # merge, unlike coverage.json whose keys have moved between kcov
+          # releases. Either way the script filters to src/ itself.
+          report=coverage/test/cobertura.xml
+          [ -f "$report" ] || report=$(find coverage -name cobertura.xml | head -1)
+          [ -n "$report" ] && [ -f "$report" ] || report=$(find coverage -name coverage.json | head -1)
+          echo "reading $report"
+          python3 .github/scripts/kcov_report.py "$report" \
+            --title "Line coverage: src/ (kcov)" > coverage-report.md
+          cat coverage-report.md >> "$GITHUB_STEP_SUMMARY"
+          cat coverage-report.md
+
+      - name: Comment the report on the pull request
+        # Same-repo pull requests only: a fork's GITHUB_TOKEN is read-only, so
+        # commenting would fail and the job summary is the fallback there.
+        if: >-
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          MARKER: '<!-- ffs-coverage-report -->'
+        run: |
+          set -uo pipefail
+          body=$(cat coverage-report.md)
+          # One comment per pull request, edited in place on later pushes.
+          existing=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments?per_page=100" \
+            | python3 -c 'import json,os,sys; m=os.environ["MARKER"]; print(next((str(c["id"]) for c in json.load(sys.stdin) if m in (c.get("body") or "")), ""))')
+          if [ -n "$existing" ]; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$existing" \
+              -f body="$body" >/dev/null && echo "updated comment $existing"
+          else
+            gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$PR/comments" \
+              -f body="$body" >/dev/null && echo "created the coverage comment"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: coverage
+          retention-days: 14
+
+      # Optional: only runs once a CODECOV_TOKEN secret exists. Without it the
+      # HTML artifact and the job summary above are the whole story.
+      - name: Upload to Codecov
+        if: env.CODECOV_TOKEN != ''
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage/test/cobertura.xml,coverage/kcov-merged/cobertura.xml
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false

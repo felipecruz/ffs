@@ -9,7 +9,7 @@ file's bytes: the 16-byte SIMD loop in `src/match.zig`. Measurements are in
 | File | Responsibility |
 |---|---|
 | `src/main.zig` | Command line; calls `search.run` |
-| `src/walk.zig` | Parallel recursive directory walk; knows nothing about searching |
+| `src/walk.zig` | Parallel recursive directory walk (worker pool over one queue); knows nothing about searching |
 | `src/search.zig` | `run`: thread pool, walk; per-file work: open, read (streaming), binary check, output |
 | `src/c_api.zig` | C ABI (`include/ffs.h`): `ffs_search` with a callback, over `search.run` |
 | `src/match.zig` | Finding the term in bytes (SIMD), with no I/O; naive reference and randomized test |
@@ -19,13 +19,13 @@ file's bytes: the 16-byte SIMD loop in `src/match.zig`. Measurements are in
 The layers connect through two small interfaces that are resolved at compile
 time (`anytype`, no runtime cost):
 
-- **walk → search.** A *visitor* has a per-directory-task `Local` state
+- **walk → search.** A *visitor* has a per-worker `Local` state
   (`initLocal`, `deinitLocal`) and a `visitFile(local, file)` function.
   `file` gives the open directory handle, the file name and the path
   relative to the root. The visitor opens and reads the file itself, so
   reading strategies (mmap, whole-file reads, buffer sizes, and so on) can
-  be tried without touching the walker. `Local` is used by only one task at
-  a time, so it holds reusable buffers.
+  be tried without touching the walker. One `Local` belongs to one worker
+  for the whole walk, so it holds reusable buffers.
 - **search → match.** `match.findLines(data, term, first_line, sink)` calls
   `sink.onLine(m)` for each matching line, with a `match.Match` (line
   number, position and line end; `m.text()` gives the line's text on
@@ -35,10 +35,42 @@ time (`anytype`, no runtime cost):
   matching algorithms go here, next to `findLinesNaive`, and the randomized
   test checks them against it.
 
+## Threads (`src/walk.zig`)
+
+`jobs` worker tasks share one queue. An item is either a directory to read
+or a batch of file names to visit, and every worker does both kinds of work,
+so the thread that happens to open a directory with 4,000 files in it is not
+the thread that has to search all 4,000.
+
+```
+queue (LIFO)   [dir "drivers/net"] [files "mm" × 32] [dir "fs/ext4"] ...
+                      ▲                                    │
+      push subdirs,   │                                    ▼ pop
+      hand off files  └──────────  worker × jobs  ──────────┘
+                                   each with one Local
+```
+
+Two details carry the performance:
+
+- **Hand off only when someone is idle.** Moving files to another worker
+  means copying their names, so a worker checks `idle` (how many workers are
+  waiting in `next`) and pays that copy only when a worker is actually free.
+  Otherwise it visits the file itself and allocates nothing. With `-j 1`,
+  `idle` is always 0 and the walk is exactly depth-first.
+- **One `Local` per worker, not per directory.** The 256 KiB read buffer and
+  the regex VM are allocated `jobs` times for the whole run. The earlier
+  design allocated them once per directory, which cost 13% even at `-j 1`
+  (EXPERIMENTS.md, Experiment 15).
+
+The queue is LIFO: the deepest directory found is the next one read, which
+keeps it short (hundreds of items for the Linux kernel tree, not 92,000).
+Termination is a `pending` count of queued-and-unfinished items; when it
+reaches zero the condition is broadcast and every worker returns.
+
 ## Where the loop sits
 
 ```
-walk.zig     one task per directory ──► visitFile(local, file)
+walk.zig     worker pool over one queue ──► visitFile(local, file)
 search.zig   read 256 KiB ─► NUL check ─► cut at last '\n' (or EOF) ─► findLines ─► carry partial line
 match.zig    findLines: 16-byte SIMD scan + newline count ─► verify candidate ─► report line ─► skip to next line
 ```
@@ -53,8 +85,8 @@ and nothing else has to count lines.
 ## Data flow for one read (`src/search.zig`)
 
 `search.run` creates the thread pool (`-j auto`: the performance-core count
-from `sysctl hw.perflevel0.logicalcpu`, see `search.autoJobs`), opens the
-root and starts the walk. Each file then goes through `Searcher.scan`. For
+from `sysctl hw.perflevel0.logicalcpu` on Apple silicon, every logical CPU
+elsewhere, see `search.autoJobs`), opens the root and starts the walk. Each file then goes through `Searcher.scan`. For
 every `readStreaming` call into the 256 KiB buffer (`search.zig:166`):
 
 1. **End of file:** a read that returns less than asked for means end of

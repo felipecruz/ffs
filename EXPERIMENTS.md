@@ -8,10 +8,12 @@ code works see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 Environment: macOS 27.0.1, Apple M5, Homebrew.
 
-> **All benchmarks run on macOS.** "Linux" in the tables below always means
-> the *Linux kernel source tree* used as a fixture (`fixtures/linux`), not
-> the Linux operating system. Conclusions about threads and system time are
-> about macOS / APFS; Linux as an OS may behave very differently.
+> **Experiments 1–14 run on macOS; Experiment 15 runs on Linux.** "Linux" in
+> the tables below always means the *Linux kernel source tree* used as a
+> fixture (`fixtures/linux`), not the Linux operating system. Conclusions
+> about threads and system time in Experiments 1–14 are about macOS / APFS.
+> Experiment 15 has its own environment table, and its numbers live in
+> `results-linux/`, never mixed with the macOS ones in `results/`.
 
 | Tool | Version | Path | Install |
 |---|---|---|---|
@@ -816,13 +818,303 @@ all). None of these were *run*: there is no Linux VM or Rosetta on this
 machine. On Linux, `std.Io.Threaded` and the code paths are the same; `-j
 auto` falls back to min(4, CPU count).
 
+## Experiment 15 — Linux: ffs vs ripgrep at matched thread counts
+
+The first run of the suite on an actual Linux machine, which Experiment 14
+left as the obvious gap. Environment:
+
+| | |
+|---|---|
+| Machine | AMD Ryzen 9 PRO 6950H, 8 cores / 16 threads, 16 MiB L3, 1 NUMA node |
+| OS | Omarchy (Arch), Linux 7.2.5-3-omarchy, x86_64, ext4 on LUKS |
+| ripgrep | 15.2.0 (`/usr/bin/rg`, `+pcre2`, runtime SIMD `+AVX2`) |
+| grep | GNU grep (`/usr/bin/grep`) |
+| ack | not packaged for Arch; its rows are missing from the Linux tables |
+| hyperfine | 1.20.0 (`pacman -S hyperfine`) |
+
+The scripts had Homebrew paths baked in, so they now resolve tools through
+`bench/tools.sh` (`RG`, `ACK`, `GREP`, `HYPERFINE`, `FFS`, `OUT` override
+anything), skip `ack` when it is missing, and read the topology with `lscpu`
+off macOS. The Linux numbers go to `results-linux/`, so the macOS baseline in
+`results/` stays untouched: the two machines are not comparable, and mixing
+them would quietly replace the numbers the other experiments rest on. All
+runs below are warm-cache, `hyperfine -N`.
+
+### What the suite said first, and why it was misleading
+
+On the kernel fixture ffs looked 2.2–2.6x *slower* than `rg -uu` (233 ms
+against 90 ms), the opposite of the macOS result. Two causes, and only the
+second one is interesting:
+
+1. `-j auto` was `min(4, CPU count)` off macOS — an Apple-silicon number
+   (Experiment 12) — so ffs ran on 4 threads while ripgrep used all 16.
+2. Even at 16 threads ffs stopped at 135 ms, because of how the walk
+   distributed work.
+
+`bench/h2h.sh` separates the two by sweeping both tools over the same thread
+counts on the same query (`PM_RESUME`, 2.0 GB, ~92,000 files):
+
+| `-j` | ffs, one task per directory | ripgrep | ffs scaling | rg scaling |
+|---:|---:|---:|---:|---:|
+| 1 | 678.5 ms | 865.8 ms | 1.00x | 1.00x |
+| 2 | 392.3 | 371.0 | 1.73x | 2.33x |
+| 4 | 229.4 | 194.7 | 2.96x | 4.45x |
+| 8 | 142.3 | 103.7 | 4.77x | 8.35x |
+| 12 | 135.7 | 88.8 | 5.00x | 9.75x |
+| 16 | 134.6 | 82.4 | 5.04x | 10.51x |
+
+**ffs is 1.28x faster than ripgrep single-threaded and 1.63x slower at 16
+threads.** The matcher was never the problem: it is the scaling, 5.0x against
+10.5x, flat past `-j 8`.
+
+### Why it stopped scaling
+
+One task per directory, and `visitFile` ran inside that task
+(`search.zig:117`), so the files of one directory were never searched
+concurrently. The kernel tree is extremely uneven — `drivers/net/ethernet`
+and `include/linux` against hundreds of three-file directories — so the run
+ended on a long serial tail: one thread working through a big directory while
+the others had nothing left to take.
+
+`std.Io.Threaded` cannot rebalance that by itself. `groupAsync`
+(`Threaded.zig:2194`) runs a task **inline** when `busy_count` has reached
+`async_limit`; it never queues work for a thread that frees up later. So
+whoever found a directory full of files was committed to searching them.
+
+### What did not work: smaller tasks in the same group
+
+First attempt: keep the design and hand each 16 files to their own
+`Group.async` task. It was *slower everywhere*, and worse the more threads it
+had:
+
+| `-j` | one task per directory | 16-file tasks |
+|---:|---:|---:|
+| 1 | 678.5 ms | 770.7 ms (+14%) |
+| 8 | 142.3 | 183.7 (+29%) |
+| 16 | 134.6 | 200.4 (+49%) |
+
+A flat 14% at `-j 1`, where there is no scheduling at all, is the giveaway:
+this was pure overhead (a name copy per file, an extra `openDir` and a fresh
+`Local` — a 256 KiB read buffer — per batch), and the inline rule above meant
+the extra tasks rarely ran anywhere else. Smaller tasks do not help when the
+scheduler has nowhere to put them.
+
+### What worked: a worker pool over one queue
+
+`src/walk.zig` is now `jobs` worker tasks sharing one LIFO queue of items,
+each item a directory to read or a batch of up to 32 file names to visit.
+Every worker does both kinds of work, so a free worker takes the next item
+instead of waiting for the thread that owns the big directory. Two details
+matter as much as the queue:
+
+- **Hand off only when a worker is idle.** Moving files to another worker
+  costs a copy of their names, so a worker checks the `idle` count first and
+  otherwise visits the file itself, allocating nothing. With `-j 1` nothing is
+  ever handed off.
+- **One `Local` per worker**, not per directory: the 256 KiB buffer and the
+  regex VM are allocated `jobs` times per run instead of ~5,000 times. This is
+  what the `-j 1` column below is measuring.
+
+| `-j` | before | after | ripgrep | after scaling | after / rg |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 678.5 ms | **580.0 ms** | 898.5 ms | 1.00x | 0.65x |
+| 2 | 392.3 | **298.6** | 372.2 | 1.94x | 0.80x |
+| 4 | 229.4 | **153.9** | 190.8 | 3.77x | 0.81x |
+| 8 | 142.3 | **87.9** | 106.2 | 6.60x | 0.83x |
+| 12 | 135.7 | **79.7** | 89.6 | 7.28x | 0.89x |
+| 16 | 134.6 | **76.0** | 80.4 | 7.63x | 0.95x |
+
+Scaling went 5.0x → 7.6x, and ffs is now faster than ripgrep at every thread
+count on this machine, including 1.69x faster than its own previous best.
+
+### `-j auto`: what the sweep says now
+
+`search.autoJobs` returns every logical CPU off macOS (Apple silicon still
+uses `hw.perflevel0.logicalcpu`). `bench/threads.sh`, full curve with `auto`
+in it:
+
+| `-j` | auto (= 16) | 1 | 2 | 3 | 4 | 5 | 6 | 8 | 10 | 12 | 16 |
+|:---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Linux `PM_RESUME` | **73.6 ms** | 570.8 | 296.0 | 200.2 | 153.0 | 125.8 | 107.6 | 86.6 | 81.1 | 77.1 | 75.1 |
+| Redis `dictFind` | 5.4 ms | 10.5 | 6.2 | 4.9 | 4.5 | 4.1 | **4.0** | 4.0 | 4.4 | 4.7 | 5.3 |
+
+- On the large fixture `auto` lands on the best setting (73.6 against 75.1 ms
+  at `-j 16` is noise, same thread count). The curve still improves from 10 to
+  16 threads, so nothing is lost by taking the CPU count.
+- On the small fixture `auto` is **1.34x off** the optimum: 5.4 ms against
+  4.0 ms at `-j 6`–`-j 8`, where 16 workers over 1,680 files is just
+  oversubscription. In absolute terms that is 1.4 ms, against 60 ms saved on
+  the kernel tree, which is the trade the default makes. A work-aware default
+  (start narrow, widen when the queue stays full) would get both; not tried.
+- Fairness check, ripgrep held to the same caps (`bench/threads.sh`): ffs
+  76.1 ms, `rg -uu` 89.1, `rg -uu -j4` 189.3, `rg -uu -j2` 365.9. On redis,
+  ffs 5.4 against `rg -uu -j4` 6.8.
+
+### Literal search, full width
+
+`bench/searches.sh`, all text files, nothing ignored, kernel tree:
+
+| Query | ffs | ffs `-j1` | `rg -uu` | `grep -rI` |
+|:---|---:|---:|---:|---:|
+| Rare `PM_RESUME` | **85.3 ms** | 588.8 | 90.4 | 1,111.9 |
+| Common `ERR_PTR` | **76.2** | 584.4 | 94.5 | 1,046.0 |
+| No match `zqxjvkwqz` | **79.9** | 587.4 | 90.4 | 885.9 |
+| Long `#include <linux/module.h>` | **76.7** | 584.1 | 100.8 | 845.2 |
+
+`bench/h2h.sh` repeats them with a `-j4` column, which is what the old
+default was costing:
+
+| Query | ffs | ffs `-j4` | `rg -uu` | `rg -uu -j4` |
+|:---|---:|---:|---:|---:|
+| Rare `PM_RESUME` | **74.0 ms** | 154.7 | 93.9 | 191.6 |
+| Common `ERR_PTR` | **84.4** | 159.0 | 101.8 | 199.0 |
+| No match `zqxjvkwqz` | **76.5** | 153.7 | 89.7 | 188.6 |
+| Long `#include <linux/module.h>` | **76.5** | 170.8 | 104.3 | 218.8 |
+
+Redis (25 MB, 1,680 files), each tool as normally run and then at equal work
+(`bench/bench.sh`):
+
+| | ffs | ffs `-j1` | rg | grep |
+|:---|---:|---:|---:|---:|
+| Defaults (rg skips `.git`, ffs and grep do not) | **5.3 ms** | — | 8.3 | 19.7 |
+| All text files, nothing ignored | **5.4** | 10.8 | 6.4 (`-uu`) | 19.0 (`-rI`) |
+
+ffs is ahead of ripgrep on every literal query on both fixtures, by 1.06–1.37x
+on the kernel tree and 1.19–1.56x on redis, and 11–13x ahead of GNU grep.
+
+### Case-insensitive
+
+`ffs -i` 71.8 ms against `rg -uu -i` 98.1 ms on `PM_RESUME` — and 71.8 ms is
+*faster than the case-sensitive 74.0 ms*, which is not noise: the matcher
+microbench below shows the same thing on every pattern.
+
+### Regex: nine patterns
+
+`bench/regex.sh`, kernel tree unless marked redis. `rg -uu -P` (PCRE2 with
+JIT) comes from `bench/h2h.sh`:
+
+| Pattern | `ffs -E` | `rg -uu` | `rg -uu -j4` | `rg -uu -P` |
+|:---|---:|---:|---:|---:|
+| `PM_[A-Z_]+` | **79.2 ms** | 96.4 | 205.6 | 324.7 |
+| `\bERR_PTR\(-E[A-Z]+\)` | **80.3** | 92.8 | 196.4 | — |
+| `\w+_lock_irqsave\(` | **76.3** | 96.4 | 200.2 | 366.6 |
+| `(spin\|mutex)_lock\(` | **77.6** | 105.2 | 220.9 | — |
+| `^\s*#\s*define\s+[A-Z_]+\s+0x[0-9a-fA-F]+` | 490.2 | **153.2** | 325.1 | 351.2 |
+| `[0-9a-f]{16}` | 1,326.9 | **281.5** | 721.5 | 498.6 |
+| `-i todo\|fixme` | 1,035.3 | **101.4** | 215.2 | — |
+| redis `dict(Find\|Delete)\(` | **5.7** | 6.6 | 7.3 | — |
+| redis `[0-9]{3,}` | 11.5 | **7.5** | 10.2 | — |
+
+With GNU grep for scale: `PM_[A-Z_]+` 81.6 ms for ffs against 1,426 ms
+(17x), and `[0-9a-f]{16}` 1,443 against **30,029 ms** (21x).
+
+- **A literal in the pattern keeps ffs ahead** (the first four rows, 1.16–1.36x
+  faster than ripgrep): the SIMD prefilter finds the candidate lines and the
+  Pike VM only sees those.
+- **Without one, ffs is 1.5–10.2x behind**, worse than the 1.4x seen on macOS,
+  because ripgrep's lazy DFA got much faster on this machine while ffs's VM
+  did not. The worst case is `-i todo|fixme` at 10.2x: an alternation of two
+  literals, where ffs has no prefilter at all and ripgrep picks both literals
+  up. That is the single strongest argument for a multi-literal prefilter.
+- It is the engine, not threads: PCRE2 is slower than ripgrep's own engine on
+  all four patterns measured and still beats `ffs -E` on the class-heavy ones,
+  and `ffs -E` scales with `-j` like everything else.
+
+### The matcher alone
+
+`bench/match.sh` on a 512 MB in-memory corpus (the kernel's `.c`/`.h` files
+concatenated), best of 7 runs, single-threaded:
+
+| Term | sensitive | insensitive |
+|:---|---:|---:|
+| `PM_RESUME` | 43.66 ms, 11.73 GB/s | 27.82 ms, **18.40 GB/s** |
+| `ERR_PTR` | 43.99, 11.64 | 31.35, 16.33 |
+| `zqxjvkwqz` | 40.80, 12.55 | 23.48, **21.80** |
+| `#include <linux/module.h>` | 42.50, 12.05 | 24.07, 21.27 |
+| `the` | 46.17, 11.09 | 29.97, 17.08 |
+| `e` | 99.46, 5.15 | 104.13, 4.92 |
+
+- 11–12.6 GB/s on realistic terms, and the one-byte term `e` (6.4 M matching
+  lines) at 5.15 GB/s is reporting cost, not search cost.
+- **The case-insensitive path is 1.4–1.7x faster than the case-sensitive one**
+  on every term but `e`, on both runs of the suite. That is backwards — `-i`
+  does strictly more work per candidate — and it is unexplained. Worth an
+  experiment of its own: if the sensitive path is leaving 40% on the table,
+  that is the largest single-thread win left.
+- End to end, the whole 2.0 GB tree is searched in 75 ms by 16 workers, which
+  is far more aggregate bandwidth than matching alone would allow, so most of
+  the wall time is still `open`/`read`, as on macOS (Experiment 13).
+
+### A Linux-only bug in the C library: `ffs_search` hung forever
+
+`zig build c-example` had never been run off macOS, and on Linux it hung on
+the first search — at *any* thread count (1, 2, 4, 16), on a 6-file directory,
+100% of runs. It reproduces on the 0.0.8 tag too, so it predates the walk
+rewrite above; the in-process tests never caught it because `zig build test`
+links the same code into one binary instead of a separate static library.
+
+The cause is in `build.zig`, not the search: the library module was built
+**without `link_libc`**, so `libffs.a` carried its own threading runtime into
+a host program that already had libc's, and the first `Io.Threaded` wait never
+woke. The whole fix is `.link_libc = true` on the library module — which macOS
+needed anyway, since `search.autoJobs` calls `sysctlbyname` there. With it,
+`examples/count.c` reports 119 matching lines for `dictFind` on redis, the same
+as the CLI and the same as the macOS run in Experiment 14.
+
+Worth remembering as a shape of bug: *the same code, linked differently*. Every
+other test in this repo exercises the Zig build of `c_api.zig`; only the C
+example exercises the artifact that users actually link.
+
+### Memory
+
+Peak RSS now follows the thread count, since each worker holds one 256 KiB
+read buffer: 8.2 MB at `-j4`, 12.2 MB at `-j16` on the kernel tree. ripgrep
+is 10.8 MB on the same search.
+
+### Correctness
+
+Speed means nothing if the tools disagree, so `bench/h2h.sh` ends by
+comparing match counts with ripgrep. Identical on all six:
+
+```
+literal PM_RESUME: 38        regex PM_[A-Z_]+: 114,746
+literal ERR_PTR: 17,569      regex [0-9a-f]{16}: 17,005
+literal zqxjvkwqz: 0         regex \w+_lock_irqsave\(: 16,957
+```
+
+`zig build test` passes on Linux (the randomized matcher, regex and C API
+tests), `zig build c-example` gives the same counts as the CLI (119 on redis
+`dictFind`) once the library links libc — see the bug below — and the debug
+build, which uses the checking allocator, reports no leak from the queue's
+hand-allocated items.
+
+### Caveats
+
+- One Linux machine, one filesystem (ext4 on LUKS), warm page cache. The
+  `-j 16` runs have a visible spread (±7 ms, about 9%), since 16 workers on 8
+  physical cores land differently each run.
+- The walk grew from 62 to 175 code lines. That is the price of the queue:
+  1.69x on this fixture, 13% even single-threaded.
+- macOS was **not** re-measured with the new walk. The `results/` tables are
+  still the one-task-per-directory design on an M5; `-j auto` there is
+  unchanged (4 performance cores), and whether a queue helps a machine where 4
+  threads was already optimal is an open question.
+- `ack` is missing from the Linux tables, and the `ignore-case-*`,
+  `*-matcher`, `*-content`, `size-variants-*` and `syscalls-*` files in
+  `results/` have no script, so they have no Linux counterpart.
+
 ## Next steps
 
 - Run on more machines: `bench/threads.sh` on another Mac (does `-j auto`
-  land on the best `-j`? see Experiment 12), and on Linux, where nothing
-  has been run yet.
-- Regex without a literal: a multi-literal prefilter (`todo|fixme`), or a
-  lazy DFA if the code size is acceptable.
+  land on the best `-j`? see Experiment 12). Linux is now covered by
+  Experiment 15, on one 16-thread box.
+- Re-measure macOS with the worker-pool walk (Experiment 15): on an M5, 4
+  threads was already the optimum, so the queue may buy nothing there — but
+  the per-worker `Local` should still help, and `results/` currently
+  describes the old design.
+- Regex without a literal: this is now the largest gap on Linux (3.3–4.8x,
+  Experiment 15). A multi-literal prefilter (`todo|fixme`), or a lazy DFA if
+  the code size is acceptable.
 - Ignore files (`.gitignore`), probably as an option, since searching
   everything is the point of the current benchmarks.
 - Unicode: case folding for `-i`, Unicode `\w`/`\b` for `-E`.

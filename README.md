@@ -1,17 +1,25 @@
 # ffs
 
-**A file searcher in about 450 lines of Zig that keeps pace with ripgrep.**
-(940 with the optional regex engine and C library.)
+[![CI](https://github.com/felipecruz/ffs/actions/workflows/ci.yml/badge.svg)](https://github.com/felipecruz/ffs/actions/workflows/ci.yml)
+
+**A file searcher in about 560 lines of Zig that keeps pace with ripgrep** —
+and on a Linux machine it is ahead of ripgrep at every thread count, on the
+Linux kernel source dataset (1.9 GB, 92,000 files). The regex engine and the
+C library are optional; staying simple is the point.
 
 No dependencies, no clever tricks. Just two ideas, done carefully:
 
-1. **Threads:** one task per directory, one worker per performance core.
+1. **Threads:** one shared queue, `N` identical workers. A queue item is
+   either a directory to read or a batch of files to search, and every worker
+   does both kinds of work, so whichever worker is free takes the next piece.
+   Nobody is left searching a 4,000-file directory alone while the other
+   threads sit idle — which is what fixed scaling on 16 threads.
 2. **SIMD:** compare 16 bytes at a time, counting line numbers in the same pass.
 
 ## Results
 
-The Linux kernel source (1.9 GB, 92,000 files) on an Apple M5 with macOS.
-Every text file is searched, nothing ignored. Times are wall-clock.
+The Linux kernel source dataset (1.9 GB, 92,000 files) on an Apple M5 with
+macOS. Every text file is searched, nothing ignored. Times are wall-clock.
 
 | Search | **ffs** | ripgrep `-j4` | ripgrep (default) | grep |
 |:---|---:|---:|---:|---:|
@@ -21,27 +29,55 @@ Every text file is searched, nothing ignored. Times are wall-clock.
 | Regex with no literal `[0-9a-f]{16}` | 2.30 s | **1.33 s** | 1.67 s | 28.3 s |
 | Redis (25 MB), 37,000 matching lines | **15.8 ms** | 23.5 ms | — | — |
 
+The same dataset on a Linux machine (AMD Ryzen 9 PRO 6950H, 16 threads,
+Omarchy/Arch), where both tools use every core:
+
+| Search | **ffs** | ripgrep | GNU grep |
+|:---|---:|---:|---:|
+| Rare word `PM_RESUME` | **74 ms** | 94 ms | 1,112 ms |
+| Common word `ERR_PTR` | **84 ms** | 102 ms | 1,046 ms |
+| Case-insensitive `-i PM_RESUME` | **72 ms** | 98 ms | — |
+| Regex `PM_[A-Z_]+` | **81 ms** | 104 ms | — |
+| Regex with no literal `[0-9a-f]{16}` | 1,361 ms | **281 ms** | — |
+| Redis (25 MB), 37,000 matching lines | **5.4 ms** | 6.5 ms | — |
+
+Both tools held to the same thread count on that Linux machine, searching
+the Linux kernel source dataset for `PM_RESUME` — this is what the shared
+queue bought (`bench/h2h.sh`):
+
+| Threads | 1 | 2 | 4 | 8 | 12 | 16 |
+|:---|---:|---:|---:|---:|---:|---:|
+| **ffs** | **580 ms** | **299** | **154** | **88** | **80** | **76** |
+| ripgrep | 898 ms | 372 | 191 | 106 | 90 | 80 |
+
 | | **ffs** | ripgrep | grep |
 |:---|---:|---:|---:|
-| Memory (Linux search) | **7–9 MB** | 10–20 MB | 3 MB |
+| Memory (kernel-tree search) | **7–9 MB** at `-j4`, 12 MB at `-j16` | 10–20 MB | 3 MB |
 | Binary | **256 KB** | 6.5 MB | 252 KB |
 | Dependencies | none | PCRE2 | zlib, bz2, lzma |
 
-- **As fast as ripgrep** at the same thread count, and about 2× faster
-  than ripgrep's default. That gap comes from the thread count: ripgrep
-  starts one thread per core, and on macOS more threads than performance
-  cores mostly fight inside the kernel.
+- **As fast as ripgrep** at the same thread count on macOS, and about 2×
+  faster than ripgrep's default there, because ripgrep starts one thread per
+  core and on macOS more threads than performance cores mostly fight inside
+  the kernel. On a Linux machine, where threads do keep paying off, ffs is
+  ahead of ripgrep at *every* thread count, from 1 to 16 (EXPERIMENTS.md,
+  Experiment 15).
+- **Scales 7.6× on 16 threads** (580 → 76 ms on the kernel source dataset),
+  against 5.0× before the shared queue landed. ripgrep scales further
+  (10.5×) but starts from a slower single-threaded time, so ffs stays ahead
+  the whole way.
 - **About 95% of the time is the kernel** opening and reading files. The
   search itself is no longer the bottleneck.
-- **Where ripgrep wins:** regexes with no fixed text in them. ripgrep has a
-  real regex engine; ffs has a small one (see below).
+- **Where ripgrep wins:** regexes with no fixed text in them — 1.4× on
+  macOS, 3.3–4.8× on Linux. ripgrep has a real regex engine; ffs has a small
+  one (see below).
 
 ## How it works
 
 | File | Code lines | What it does |
 |---|---:|---|
 | `src/main.zig` | 70 | Command line |
-| `src/walk.zig` | 62 | Parallel directory walk: one task per directory |
+| `src/walk.zig` | 175 | Parallel directory walk: worker pool over one queue |
 | `src/search.zig` | 168 | Thread pool; stream each file, skip binaries, report matches |
 | `src/match.zig` | 141 | SIMD search |
 | `src/regex.zig` | 422 | Optional regex: parser + Pike VM |
@@ -68,7 +104,8 @@ small file costs exactly `open`, `read` and `close`.
 ```
 ffs [-j N|auto] [-i] [-E] [--content] <folder> <term>
 
-  -j N|auto          worker threads (default: auto = performance cores)
+  -j N|auto          worker threads (default: auto = performance cores on
+                     Apple silicon, every logical CPU elsewhere)
   -i, --ignore-case  ASCII case-insensitive
   -E, --regex        <term> is a regex: . [a-z] [^0-9] \d \w \s \b ^ $ * + ? {n,m} | ( )
   --content          print path:line:content instead of path:line
@@ -93,15 +130,17 @@ ffs_search("src", "TODO", FFS_IGNORE_CASE, 0, on_match, NULL);
 
 ## Limitations
 
-- **Tested on one Mac.** It builds for Linux, Windows and Intel macOS, but
-  those builds have never been run. `-j auto` reads the performance-core
-  count on Apple silicon, and uses 4 elsewhere.
+- **Tested on one Mac and one Linux box** (Apple M5; AMD Ryzen 9 PRO 6950H
+  on Omarchy/Arch, EXPERIMENTS.md, Experiment 15). It builds for Windows and
+  Intel macOS, but those builds have never been run. `-j auto` reads the
+  performance-core count on Apple silicon and uses every logical CPU
+  elsewhere.
 - **No ignore files.** ffs searches everything, including `.git`, and skips
   only binary files (any file with a NUL byte).
 - **ASCII semantics.** `-i`, `\w` and `\b` are ASCII-only, like ripgrep's
   `(?-u)` mode.
-- **Regexes with no fixed text are about 2× slower than ripgrep's** (the
-  table above).
+- **Regexes with no fixed text are slower than ripgrep's**: about 2× on
+  macOS, 3.3–4.8× on Linux (the tables above).
 
 ## Correctness
 
@@ -114,9 +153,24 @@ Every feature was also compared with ripgrep's output, byte for byte, on
 both codebases. Output is identical except for one case: a file with a NUL
 byte late in it, which ripgrep partly prints and ffs skips.
 
+CI (GitHub Actions) runs the tests on Linux and macOS, checks `zig fmt`,
+smoke-tests the CLI and the C library, and cross-compiles all six targets.
+Line coverage for `src/` is measured with `kcov` (Zig has no coverage of its
+own) and posted on each pull request as a per-file table, with the HTML
+report kept as a build artifact.
+
+`bench/h2h.sh` re-checks that on every run: ffs and ripgrep report identical
+match counts for three literals and three regexes on the kernel source
+dataset (38,
+17,569, 0, 114,746, 17,005 and 16,957 lines), so a speed number can never
+come from work that was skipped. `zig build c-example` links the static
+library and reports the same count as the CLI on Linux too — it used to hang
+there forever, because `libffs.a` was built without libc
+(EXPERIMENTS.md, Experiment 15).
+
 ## More
 
 - [ARCHITECTURE.md](ARCHITECTURE.md): how the code works, the 16-byte loop
   and the regex engine.
-- [EXPERIMENTS.md](EXPERIMENTS.md): the full lab notebook, with 14
+- [EXPERIMENTS.md](EXPERIMENTS.md): the full lab notebook, with 15
   experiments, every benchmark and what didn't work.
