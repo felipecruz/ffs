@@ -1,0 +1,10 @@
+# Build output
+.zig-cache/
+zig-out/
+
+# Benchmark corpora (2+ GB); see EXPERIMENTS.md, "Setup", to recreate them
+fixtures/
+
+# Local tool state and stray builds
+.aiflow/
+/ffs

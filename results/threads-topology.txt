@@ -1,0 +1,7 @@
+Apple M5
+hw.logicalcpu: 10
+hw.nperflevels: 2
+hw.perflevel0.name: Super
+hw.perflevel0.logicalcpu: 4
+hw.perflevel1.name: Efficiency
+hw.perflevel1.logicalcpu: 6
