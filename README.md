@@ -4,8 +4,8 @@
 
 **A file searcher in about 560 lines of Zig that keeps pace with ripgrep** —
 and on a Linux machine it is ahead of ripgrep at every thread count, on the
-Linux kernel source dataset (1.9 GB, 92,000 files).
-(1,050 lines with the optional regex engine and C library.)
+Linux kernel source dataset (1.9 GB, 92,000 files). The regex engine and the
+C library are optional; staying small is the point.
 
 No dependencies, no clever tricks. Just two ideas, done carefully:
 
