@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.0.9 — unreleased
 
 Measured on Linux for the first time (AMD Ryzen 9 PRO 6950H, 16 threads,
 Omarchy/Arch): see EXPERIMENTS.md, Experiment 15.
