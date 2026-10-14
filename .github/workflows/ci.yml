@@ -46,7 +46,8 @@ jobs:
           [ "$($ffs src zqxjvkwqz | wc -l)" -eq 0 ]
           [ "$($ffs -i src FINDLINES | wc -l)" -gt 0 ]
           [ "$($ffs -E src 'find[A-Z][a-z]+' | wc -l)" -gt 0 ]
-          $ffs --content src findLines | head -1 | grep -q 'src/.*:[0-9]\+:'
+          content=$($ffs --content src findLines)
+          grep -Eq 'src/.*:[0-9]+:' <<<"$content"
           # -j 1 and -j auto must find exactly the same lines.
           diff <($ffs -j1 src findLines | sort) <($ffs src findLines | sort)
           $ffs --version
