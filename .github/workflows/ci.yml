@@ -144,14 +144,37 @@ jobs:
 
       - name: Run tests under kcov
         # Zig has no coverage instrumentation, so kcov reads DWARF from the
-        # debug test binary. Only src/ counts; the std library is excluded.
+        # debug test binary. The include pattern has no leading slash so it
+        # matches both shapes kcov reports: the DWARF line table holds
+        # absolute paths (/home/runner/work/ffs/ffs/src/walk.zig) while its
+        # Cobertura output writes them relative to <source> (src/walk.zig).
         run: |
           set -euo pipefail
-          kcov --include-pattern=/src/ --exclude-pattern=/test/,/lib/std/ \
+          kcov --include-pattern=src/ --exclude-pattern=/lib/std/,/zig/lib/ \
             coverage zig-out/test/test
 
       - name: What kcov wrote
-        run: find coverage -maxdepth 2 | sort
+        # Printed every run: when coverage comes out empty, the paths kcov
+        # actually recorded are the only thing that explains why.
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          find coverage -maxdepth 3 | sort
+          for xml in $(find coverage -name cobertura.xml); do
+            echo "--- $xml (first filenames)"
+            grep -o 'filename="[^"]*"' "$xml" | head -10 || true
+          done
+          for json in $(find coverage -name coverage.json); do
+            echo "--- $json"
+            python3 - "$json" <<'PY'
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          files = d.get("files", [])
+          print(f"  files recorded: {len(files)}")
+          for f in files[:20]:
+              print(f"    {f.get('file')}  ({f.get('covered_lines')}/{f.get('total_lines')})")
+          PY
+          done
 
       - name: Build the coverage report
         # Reporting must never be what fails the job: the kcov run above
@@ -159,8 +182,14 @@ jobs:
         continue-on-error: true
         run: |
           set -uo pipefail
-          json=$(find coverage -name coverage.json | head -1)
-          python3 .github/scripts/kcov_report.py "$json" \
+          # Cobertura first: fixed schema, and written per binary and per
+          # merge, unlike coverage.json whose keys have moved between kcov
+          # releases. Either way the script filters to src/ itself.
+          report=coverage/test/cobertura.xml
+          [ -f "$report" ] || report=$(find coverage -name cobertura.xml | head -1)
+          [ -n "$report" ] && [ -f "$report" ] || report=$(find coverage -name coverage.json | head -1)
+          echo "reading $report"
+          python3 .github/scripts/kcov_report.py "$report" \
             --title "Line coverage: src/ (kcov)" > coverage-report.md
           cat coverage-report.md >> "$GITHUB_STEP_SUMMARY"
           cat coverage-report.md
