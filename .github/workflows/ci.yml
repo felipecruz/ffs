@@ -102,7 +102,29 @@ jobs:
           version: ${{ env.ZIG_VERSION }}
 
       - name: Install kcov
-        run: sudo apt-get update && sudo apt-get install -y kcov
+        # kcov is no longer packaged for current Ubuntu runners ("Unable to
+        # locate package kcov"), so try apt first and otherwise build it. The
+        # dependency list is kcov's own; the tag is pinned, with the default
+        # branch as a fallback so a missing tag cannot break the job.
+        env:
+          KCOV_VERSION: v43
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          if sudo apt-get install -y kcov; then
+            kcov --version
+            exit 0
+          fi
+          echo "::notice::kcov not in apt; building $KCOV_VERSION from source"
+          sudo apt-get install -y \
+            build-essential cmake binutils-dev libcurl4-openssl-dev \
+            zlib1g-dev libdw-dev libiberty-dev
+          git clone --depth 1 --branch "$KCOV_VERSION" https://github.com/SimonKagstrom/kcov.git /tmp/kcov \
+            || git clone --depth 1 https://github.com/SimonKagstrom/kcov.git /tmp/kcov
+          cmake -S /tmp/kcov -B /tmp/kcov/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local
+          cmake --build /tmp/kcov/build --parallel "$(nproc)"
+          sudo cmake --install /tmp/kcov/build
+          kcov --version
 
       - name: Build the test binary
         run: zig build test-bin
@@ -114,6 +136,9 @@ jobs:
           set -euo pipefail
           kcov --include-pattern=/src/ --exclude-pattern=/test/,/lib/std/ \
             coverage zig-out/test/test
+
+      - name: What kcov wrote
+        run: find coverage -maxdepth 2 | sort
 
       - name: Summarize
         # Reporting must never be what fails the job: the coverage run above
@@ -162,6 +187,6 @@ jobs:
         if: env.CODECOV_TOKEN != ''
         uses: codecov/codecov-action@v4
         with:
-          files: coverage/test/cobertura.xml
+          files: coverage/test/cobertura.xml,coverage/kcov-merged/cobertura.xml
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: false
