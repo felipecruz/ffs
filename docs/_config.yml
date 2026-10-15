@@ -18,6 +18,8 @@ back_to_top: true
 footer_content: Every example on these pages is run and checked in CI (tests/docs.sh).
 exclude:
   - ffs.1
+  - demo.sh
+  - demo.tape
 defaults:
   - { scope: { path: README.md }, values: { title: Home, nav_order: 1, permalink: / } }
   - { scope: { path: patterns.md }, values: { title: Patterns, nav_order: 2 } }

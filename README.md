@@ -8,6 +8,8 @@ flags coding agents actually use (`-n`, `-g`, `--files`, `-o`, `-c`, `-l`,
 ripgrep prints (`tests/compat.sh` checks 97 command lines). It is faster
 than ripgrep on most searches and slower on some, all listed below.
 
+![ffs searching the Linux kernel source, and ripgrep for comparison](docs/demo.gif)
+
 ## What it looks like
 
 Run from inside the Redis source, as an agent would:

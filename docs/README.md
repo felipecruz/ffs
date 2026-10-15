@@ -4,6 +4,8 @@ ffs searches files for a pattern, with ripgrep's command line: the same
 flags, the same defaults and the same output, for the flags it has. If you
 know `rg`, you know ffs; these pages are for the details.
 
+![ffs searching the Linux kernel source, and ripgrep for comparison](demo.gif)
+
 ```console
 $ ffs -n -w 'dictFind|dictAdd|dictDelete' src/dict.h
 125: * dictAdd, dictFind, and other functions against the dictionary even while
@@ -75,6 +77,9 @@ each `$ ffs ...` line inside the Redis 8.0.2 source and checks that the
 output is what the page shows; CI does the same on every push. It also checks
 that every flag ffs accepts is in the man page and in `ffs --help`. After
 changing ffs, `tests/docs.sh --update` rewrites the outputs from real runs.
+The terminal demo above is recorded with
+[vhs](https://github.com/charmbracelet/vhs) from `demo.tape`
+(`docs/demo.sh`).
 
 Lines can come out in another order than shown: ffs searches files in
 parallel, as ripgrep does. A block ending in `...` was cut short.
