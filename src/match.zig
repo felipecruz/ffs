@@ -107,6 +107,75 @@ fn find(comptime case: Case, data: []const u8, term: []const u8, first_line: usi
     return line + std.mem.countScalar(u8, data[i..], '\n');
 }
 
+/// The most terms `findLinesAny` takes.
+pub const max_terms = 16;
+
+/// `findLines` for lines that contain any of `terms` (1 to `max_terms`, none
+/// empty): a regex alternation such as `func cancel|killGrace|cleanup`. The
+/// same loop as `find`, with every term's first and last byte compared
+/// against each block, so a candidate is a position where some term's two
+/// end bytes line up.
+pub fn findLinesAny(comptime case: Case, data: []const u8, terms: []const []const u8, first_line: usize, sink: anytype) !usize {
+    std.debug.assert(terms.len >= 1 and terms.len <= max_terms);
+    var firsts: [max_terms]Byte(case) = undefined;
+    var lasts: [max_terms]Byte(case) = undefined;
+    var max_len: usize = 0;
+    for (terms, 0..) |t, k| {
+        firsts[k] = .init(t[0]);
+        lasts[k] = .init(t[t.len - 1]);
+        max_len = @max(max_len, t.len);
+    }
+    const newline: Vec = @splat('\n');
+    var line: usize = first_line;
+    var nl_acc: Vec = @splat(0);
+    var nl_blocks: u8 = 0;
+
+    var i: usize = 0;
+    outer: while (i + vec_len + max_len - 1 <= data.len) {
+        const a: Vec = data[i..][0..vec_len].*;
+        const is_nl = a == newline;
+        var mask: Mask = 0;
+        for (terms, firsts[0..terms.len], lasts[0..terms.len]) |t, f, l| {
+            const b: Vec = data[i + t.len - 1 ..][0..vec_len].*;
+            mask |= f.eqlMask(a) & l.eqlMask(b);
+        }
+        while (mask != 0) : (mask &= mask - 1) {
+            const lane: Lane = @intCast(@ctz(mask));
+            const pos = i + lane;
+            if (anyAt(case, data, pos, terms)) {
+                line += flush(&nl_acc, &nl_blocks);
+                const nl_mask: Mask = @bitCast(is_nl);
+                line += @popCount(nl_mask & ((@as(Mask, 1) << lane) - 1));
+                i = try report(data, pos, &line, sink) orelse return line;
+                continue :outer;
+            }
+        }
+        nl_acc += @select(u8, is_nl, @as(Vec, @splat(1)), @as(Vec, @splat(0)));
+        nl_blocks += 1;
+        if (nl_blocks == 255) line += flush(&nl_acc, &nl_blocks);
+        i += vec_len;
+    }
+    line += flush(&nl_acc, &nl_blocks);
+
+    // Tail: too close to the end for the longest term's block load.
+    while (i < data.len) {
+        if (anyAt(case, data, i, terms)) {
+            i = try report(data, i, &line, sink) orelse return line;
+        } else {
+            line += @intFromBool(data[i] == '\n');
+            i += 1;
+        }
+    }
+    return line;
+}
+
+fn anyAt(comptime case: Case, data: []const u8, pos: usize, terms: []const []const u8) bool {
+    for (terms) |t| {
+        if (pos + t.len <= data.len and eql(case, data[pos..][0..t.len], t)) return true;
+    }
+    return false;
+}
+
 // One byte of the term, splatted for comparing against a block. Ignoring
 // case, a letter is compared as `(v | 0x20) == lower`: setting bit 5 maps
 // 'A'-'Z' onto 'a'-'z', and only 'A'-'Z' and 'a'-'z' land on 'a'-'z', so the
@@ -267,6 +336,50 @@ test "SIMD search matches naive search on long inputs" {
             const naive_after = try findLinesNaive(case, data, term, 7, CollectLines{ .gpa = gpa, .lines = &naive_lines, .first_line = 7 });
             try std.testing.expectEqualSlices(usize, naive_lines.items, simd_lines.items);
             try std.testing.expectEqual(naive_after, simd_after);
+        }
+    }
+}
+
+test "findLinesAny matches a line-by-line reference" {
+    const gpa = std.testing.allocator;
+    var prng: std.Random.DefaultPrng = .init(0xa11);
+    const rand = prng.random();
+    const alphabet = "abAB\n";
+    var data_buf: [700]u8 = undefined;
+    var term_bufs: [max_terms][6]u8 = undefined;
+    var terms: [max_terms][]const u8 = undefined;
+    var got: std.ArrayList(usize) = .empty;
+    defer got.deinit(gpa);
+    var want: std.ArrayList(usize) = .empty;
+    defer want.deinit(gpa);
+
+    for (0..5_000) |_| {
+        const data = data_buf[0..rand.uintAtMost(usize, data_buf.len)];
+        for (data) |*c| c.* = alphabet[rand.uintLessThan(usize, alphabet.len)];
+        const n_terms = 1 + rand.uintLessThan(usize, max_terms);
+        for (terms[0..n_terms], term_bufs[0..n_terms]) |*t, *buf| {
+            t.* = buf[0 .. 1 + rand.uintLessThan(usize, buf.len)];
+            for (@constCast(t.*)) |*c| c.* = alphabet[rand.uintLessThan(usize, 4)];
+        }
+        const first_line = 1 + rand.uintLessThan(usize, 50);
+
+        inline for (.{ Case.sensitive, Case.insensitive }) |case| {
+            got.clearRetainingCapacity();
+            want.clearRetainingCapacity();
+            const after = try findLinesAny(case, data, terms[0..n_terms], first_line, CollectLines{ .gpa = gpa, .lines = &got, .first_line = first_line });
+            var it = std.mem.splitScalar(u8, data, '\n');
+            var ln = first_line;
+            while (it.next()) |text| : (ln += 1) {
+                for (terms[0..n_terms]) |t| {
+                    const hit = if (case == .sensitive) std.mem.indexOf(u8, text, t) else std.ascii.findIgnoreCase(text, t);
+                    if (hit != null) {
+                        try want.append(gpa, ln);
+                        break;
+                    }
+                }
+            }
+            try std.testing.expectEqualSlices(usize, want.items, got.items);
+            try std.testing.expectEqual(first_line + std.mem.countScalar(u8, data, '\n'), after);
         }
     }
 }
