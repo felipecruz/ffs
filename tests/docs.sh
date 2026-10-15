@@ -14,6 +14,9 @@
 #   git clone --depth 1 --branch 8.0.2 https://github.com/redis/redis.git fixtures/redis
 set -u
 shopt -s nullglob
+# One locale everywhere, so `sort` and `ls` in the examples (and the
+# comparisons here) order lines the same on every machine.
+export LC_ALL=C
 cd "$(dirname "$0")/.."
 UPDATE=0
 [ "${1:-}" = --update ] && { UPDATE=1; shift; }

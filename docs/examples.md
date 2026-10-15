@@ -25,9 +25,9 @@ $ ffs --files -g '*README*' -g Makefile -g AGENTS.md -d 2
 Makefile
 README.md
 modules/Makefile
-tests/README.md
 deps/Makefile
 deps/README.md
+tests/README.md
 src/Makefile
 ```
 
@@ -191,9 +191,9 @@ $ ffs -n -e DICT_OK -e DICT_ERR src/dict.h
 
 ```console
 $ ffs -n 'TODO' -g '!deps/**'
-tests/test_helper.tcl:490:    # TODO: print the status, exit with the right exit code.
 tests/assets/test_cli_hint_suite.txt:28:# TODO: The following hints end with an unbalanced "]" which shouldn't be there.
-src/dict.h:66:    /* TODO: Add a 'keys_are_even' flag and use a similar optimization if that
+tests/test_helper.tcl:490:    # TODO: print the status, exit with the right exit code.
+utils/req-res-log-validator.py:61:    # TODO: for vector-sets module
 ...
 ```
 
@@ -259,12 +259,12 @@ src/server.c:54
 $ ffs -l aeCreateFileEvent src
 src/ae.c
 src/ae.h
-src/iothread.c
 src/bio.c
+src/iothread.c
 src/replication.c
 src/module.c
-src/sentinel.c
 src/tls.c
+src/sentinel.c
 src/server.c
 src/rdb.c
 src/redis-benchmark.c
@@ -320,11 +320,11 @@ $ ffs -l aeCreateFileEvent src | ffs -v '^src/ae'
 src/iothread.c
 src/bio.c
 src/replication.c
-src/module.c
 src/sentinel.c
-src/tls.c
 src/server.c
+src/module.c
 src/socket.c
+src/tls.c
 src/rdb.c
 src/redis-benchmark.c
 ```
@@ -332,16 +332,13 @@ src/redis-benchmark.c
 **Search another command's output**
 
 ```console
-$ ls src/modules | ffs -n 'Makefile|\.c$'
-1:helloacl.c
-2:helloblock.c
-3:hellocluster.c
-4:hellodict.c
-5:hellohook.c
-6:hellotimer.c
-7:hellotype.c
-8:helloworld.c
-9:Makefile
+$ head -40 src/server.h | ffs -n '#include "'
+18:#include "fmacros.h"
+19:#include "config.h"
+20:#include "solarisfixes.h"
+21:#include "rio.h"
+22:#include "atomicvar.h"
+23:#include "commands.h"
 ```
 
 **Search the files a first search found**
