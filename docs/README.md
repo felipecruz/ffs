@@ -23,6 +23,40 @@ $ ffs -n -w 'dictFind|dictAdd|dictDelete' src/dict.h
 
 ## Install
 
+### From a release
+
+Each [release](https://github.com/felipecruz/ffs/releases) has an archive
+per platform, holding the `ffs` binary, the man page, the C library with its
+header, and the README and CHANGELOG:
+
+| Platform | Archive |
+|:---|:---|
+| Linux, x86-64 | `ffs-VERSION-x86_64-linux-gnu.tar.gz`, or `x86_64-linux-musl` for a static binary |
+| Linux, ARM64 | `ffs-VERSION-aarch64-linux-gnu.tar.gz` |
+| macOS, Apple silicon | `ffs-VERSION-aarch64-macos.tar.gz` |
+| macOS, Intel | `ffs-VERSION-x86_64-macos.tar.gz` |
+| Windows, x86-64 | `ffs-VERSION-x86_64-windows.zip` |
+
+To download one, check it against the release's `SHA256SUMS`, and install
+it in `~/.local`:
+
+```sh
+v=0.0.8 t=x86_64-linux-gnu
+url=https://github.com/felipecruz/ffs/releases/download/v$v
+curl -LO "$url/ffs-$v-$t.tar.gz" -LO "$url/SHA256SUMS"
+grep " ffs-$v-$t.tar.gz\$" SHA256SUMS | sha256sum -c    # macOS: shasum -a 256 -c
+tar xzf "ffs-$v-$t.tar.gz"
+mkdir -p ~/.local/bin ~/.local/share/man/man1
+cp "ffs-$v-$t/ffs" ~/.local/bin/
+cp "ffs-$v-$t/ffs.1" ~/.local/share/man/man1/
+```
+
+With `~/.local/bin` on your `PATH`, `man ffs` finds the page too: `man`
+looks in `../share/man` next to each directory on the `PATH`. On Windows,
+unzip the archive and put `ffs.exe` in a directory on the `PATH`.
+
+### From source
+
 ffs builds with Zig 0.17 and has no dependencies:
 
 ```sh

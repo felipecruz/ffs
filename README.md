@@ -168,6 +168,15 @@ linear time with no backtracking, so no pattern can blow up.
 **Streaming.** Files go through a 256 KiB buffer, never loaded whole. A
 small file costs exactly `open`, `read` and `close`.
 
+## Install
+
+Download the archive for your platform from the
+[releases](https://github.com/felipecruz/ffs/releases) (Linux x86-64, glibc
+or static musl, and ARM64; macOS Apple silicon and Intel; Windows x86-64),
+and put `ffs` on your `PATH` and `ffs.1` in a `man1` directory. Or build it
+with Zig 0.17: `zig build`. The [install page](docs/README.md#install) has
+the commands, with the checksum check.
+
 ## Usage
 
 ```
