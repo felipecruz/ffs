@@ -6,8 +6,7 @@
 flags coding agents actually use (`-n`, `-g`, `--files`, `-o`, `-c`, `-l`,
 `-v`, `-A/-B/-C`, …), respects `.gitignore`, and prints exactly what
 ripgrep prints (`tests/compat.sh` checks 97 command lines). It is faster
-than ripgrep on most searches and slower on some, all listed below. No
-dependencies; staying simple is the point.
+than ripgrep on most searches and slower on some, all listed below.
 
 ## What it looks like
 
