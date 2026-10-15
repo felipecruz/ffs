@@ -1,111 +1,77 @@
 # Changelog
 
-## 0.0.9 — unreleased
+## 0.0.8 — 2026-10-15
 
-**Breaking: the command line is now ripgrep's**, so ffs can stand in for
-`rg` in what coding agents run (SEARCH_CMDs.md).
-`ffs <folder> <term>` is now `ffs PATTERN [PATH...]`; `-E` and `--content`
-are gone (PATTERN is a regex, and `-n` prints `path:line:content`).
+First release: a file searcher with ripgrep's command line, for the flags
+coding agents use (SEARCH_CMDs.md), measured on macOS (Apple M5) and Linux
+(AMD Ryzen 9 PRO 6950H, 16 threads, Omarchy/Arch). Every number below is in
+the README and EXPERIMENTS.md.
 
-- PATTERN is a regex by default; one with no regex syntax still goes
-  straight to the SIMD search, so literal searches cost what they did.
-  `-F`, `-e` (several patterns), `-w`, `-x`, `-S`, `-s`.
+**Command line**
+
+- `ffs PATTERN [PATH...]` and `ffs --files [PATH...]`, as in ripgrep.
+  PATTERN is a regex; one with no regex syntax goes straight to the SIMD
+  search. `-e` (several patterns), `-F`, `-w`, `-x`, `-i`, `-S`, `-s`, `-v`.
 - Paths: any number of files and directories, `-` for standard input, and
   standard input by default when something is piped in. No path: the
   current directory, printed without `./`.
 - ripgrep's defaults: hidden files and whatever `.gitignore` (inside a git
   repository), `.ignore`, `.rgignore` and `.git/info/exclude` list are
-  skipped, including ignore files in the directories above the search
-  root. `--hidden`, `--no-ignore`, `--no-ignore-vcs`, `-u`/`-uu`/`-uuu`.
-  On the Linux kernel fixture the default search is still 79 ms, against
-  100 ms for ripgrep's default.
+  skipped, including ignore files in the directories above the search root.
+  `--hidden`, `--no-ignore`, `--no-ignore-vcs`, `-u`/`-uu`/`-uuu`, `-a`.
 - `--files`, `-g`/`--glob` (gitignore syntax, `**`, `{a,b}`, `!` to
-  exclude), `-d`/`--max-depth`.
-- Output modes: `-n`/`-N`, `-H`/`-I`, `-o`, `-c`, `-l`, `-q`, `-m`, `-v`,
-  `-A`/`-B`/`-C` (with ripgrep's `-` and `--` separators), `-a`.
-- Exit status as in ripgrep: 0 on a match, 1 on none, 2 on an error (a
-  missing path is reported and the other paths are still searched).
-- Regex: `(?:...)`, `(?i)`, lazy `*?` `+?` `??`, `\r`, `\xNN`, POSIX classes
-  (`[[:alpha:]]`), and `\b` sees UTF-8 characters, as in ripgrep.
-- Regex prefilter for alternations, the most common shape of agent search
-  (`a|b|c`): every match must contain one of a set of up to 16 literals,
-  and a new SIMD loop (`match.findLinesAny`) finds the lines that contain
-  any of them. When the regex is nothing but those literals, the VM is
-  skipped. `PM_RESUME|ERR_PTR|dictFind` on the Linux kernel fixture: 1.18 s
-  to 106 ms (ripgrep: 124 ms).
-- Optional PCRE2 build, `zig build -Dpcre2=true` (links the system's
-  libpcre2-8). Patterns are still parsed and validated by regex.zig; PCRE2's
-  JIT replaces the Pike VM for candidate lines, `-o` and whole-buffer scans
-  of regexes with no literal. Kernel fixture: `[0-9a-f]{16}` 1,382 to
-  392 ms (ripgrep 296), `spin_lock|mutex_lock|struct [a-z]+_ops` 261 to
-  123 ms (ripgrep 140). Patterns with `\b` keep the VM, whose `\b` sees
-  UTF-8 as ripgrep's does.
-- Docs: `docs/` has a page per topic (patterns, files, output, ripgrep),
-  about 30 examples and a man page, `docs/ffs.1`, installed by `zig build`
-  to `share/man/man1`. New `tests/docs.sh` runs every example inside the
-  Redis 8.0.2 source and checks its output, and checks that every flag is
-  in the man page and in `--help`; `--update` rewrites the outputs. CI
-  fetches Redis to run it. It found `--no-hidden` missing from `--help`.
-  `.github/workflows/pages.yml` publishes `docs/` as a GitHub Pages site
-  (Just the Docs theme, with search), the man page included.
-- New `bench/agent.sh`: 15 agent-style calls on the Redis source, each
-  timed against ripgrep with identical output required; the table is in
-  the README. ffs is faster on 14 of them and 2.4x slower on a regex with
-  no literal.
-- New `tests/compat.sh`: about 100 command lines run through ffs and
-  ripgrep, comparing output and exit status; run in CI on Linux and macOS.
+  exclude, matched against the path as printed), `-d`/`--max-depth`.
+- Output as ripgrep prints it in a pipe: `-n`/`-N`, `-H`/`-I`, `-o`, `-c`,
+  `-l`, `-q`, `-m`, `-A`/`-B`/`-C` with `-` and `--` separators. Exit status
+  0 on a match, 1 on none, 2 on an error (a missing path is reported and the
+  other paths are still searched). `-j N|auto`, `-V`, `-h`.
+- `tests/compat.sh` runs 97 command lines through ffs and ripgrep and
+  compares stdout and exit status; CI runs it on Linux and macOS.
 
-Measured on Linux for the first time (AMD Ryzen 9 PRO 6950H, 16 threads,
-Omarchy/Arch): see EXPERIMENTS.md, Experiment 15.
+**Search**
 
-- Threads: a worker pool over one shared queue of directories and file
-  batches, instead of one task per directory. A directory with thousands of
-  files no longer pins the thread that found it, and the read buffer is
-  allocated once per worker instead of once per directory. On the Linux
-  kernel fixture: 1.69x faster at `-j 16` (135 ms to 79 ms), and 13% faster
-  even at `-j 1`; thread scaling 5.0x to 7.4x.
-- `-j auto` now uses every logical CPU off macOS, instead of 4. The old
-  fallback was an Apple-silicon number and cost 1.74x on a 16-thread box.
-  Apple silicon still uses its performance-core count.
-- Fixed: `ffs_search` from the C library hung forever on Linux, at any thread
-  count. `libffs.a` was built without `link_libc`, so it brought its own
-  threading runtime into a host program that already had libc's. Present in
-  0.0.8; never seen because the C example had only ever been run on macOS.
-- CI/CD on GitHub Actions: `ci.yml` runs `zig fmt`, the tests, a CLI smoke
-  test, a C library smoke test (with a timeout, so the hang above cannot
-  come back unnoticed) and a version-consistency check on Linux and macOS,
-  cross-compiles all six targets, and publishes a `kcov` line-coverage
-  report for `src/`, posted on each pull request as a per-file table (one
-  comment, edited in place) and kept as an HTML artifact.
-  `release.yml` builds every target on a tag and attaches
-  the archives, with the CHANGELOG section as the release notes. New
-  `zig build test-bin` builds the test binary without running it, for the
-  coverage tool.
-- Benchmark scripts find their tools through `bench/tools.sh` (`RG`, `ACK`,
-  `GREP`, `HYPERFINE`, `FFS`, `OUT` all overridable) instead of hardcoded
-  Homebrew paths, skip `ack` when it is not installed, and read the CPU
-  topology with `lscpu` off macOS. New `bench/h2h.sh`: ffs vs ripgrep at
-  matched thread counts.
-
-## 0.0.8 — 2026-10-14
-
-First tagged release.
-
-- `ffs <folder> <term>`: recursive search of every text file (nothing
-  ignored, binary files skipped), printing `path:line`.
-- Threads: one task per directory on `std.Io.Threaded`; `-j N` or `-j auto`
-  (default: the performance-core count on Apple silicon, else 4). Both
-  changed in Unreleased, above.
 - SIMD search: first/last byte filter over 16-byte blocks, with line
-  numbers counted in the same pass.
-- `--content` prints `path:line:content`.
-- `-i` ASCII case-insensitive search.
-- `-E` regex: `.` `[...]` `\d \w \s \b` `^ $` `* + ? {n,m}` `|` `( )`, a Pike
-  VM behind a SIMD literal prefilter.
-- Streaming reads through a 256 KiB buffer (7–9 MB peak memory); a UTF-8
-  byte-order mark is stripped, as ripgrep does.
-- C library: `libffs.a` + `ffs.h` with `ffs_search()` and `ffs_version()`.
-- `-V`/`--version`.
+  numbers counted in the same pass. Streaming reads through a 256 KiB
+  buffer (7–12 MB peak memory); a UTF-8 byte-order mark is stripped and
+  files with a NUL byte are skipped, as binary.
+- Regex: `.` `[...]` `[[:alpha:]]` `\d \w \s \b` `\t \r \xNN` `^ $`
+  `* + ? {n,m}` and lazy forms, `|`, `(...)`, `(?:...)`, `(?i)`, on a Pike
+  VM that never backtracks. `\b` sees UTF-8 characters, as ripgrep does.
+- A literal prefilter in front of the VM: the SIMD search finds the lines
+  containing one of up to 16 literals every match needs (`PM_` in
+  `PM_[A-Z_]+`, either name in `dictFind|dictAdd`), and an alternation of
+  plain text skips the VM. `PM_RESUME|ERR_PTR|dictFind` on the Linux kernel:
+  106 ms, against 124 ms for ripgrep.
+- Optional PCRE2 build, `zig build -Dpcre2=true`: the system's PCRE2 JIT
+  does the VM's work. `[0-9a-f]{16}` on the Linux kernel: 1,382 ms to
+  392 ms (ripgrep 296).
 
-Tested on macOS (Apple M5) only; builds for Linux, Windows and Intel macOS
-are untested. See EXPERIMENTS.md for every benchmark.
+**Threads**
+
+- A worker pool over one shared queue of directories and file batches, so
+  a directory with thousands of files no longer pins one thread. Thread
+  scaling on 16 threads: 7.6x; ahead of ripgrep at every thread count from
+  1 to 16 on Linux.
+- `-j auto`: the performance-core count on Apple silicon, every logical CPU
+  elsewhere.
+
+**C library**
+
+- `libffs.a` + `ffs.h` with `ffs_search()` and `ffs_version()`. Built with
+  `link_libc`: without it, `ffs_search` hung forever on Linux.
+
+**Docs and tooling**
+
+- `docs/`: a page per topic, about 30 examples and a man page (`docs/ffs.1`,
+  installed by `zig build`), published at https://felipecruz.github.io/ffs/.
+  `tests/docs.sh` runs every example inside the Redis 8.0.2 source and
+  checks its output, and checks that every flag is documented.
+- CI on GitHub Actions: `zig fmt`, the tests, CLI and C library smoke tests,
+  ripgrep compatibility, the docs check, the PCRE2 build, a version check,
+  six cross-compiled targets and a `kcov` coverage report on pull requests.
+  `release.yml` builds every target on a tag and attaches the archives.
+- Benchmarks: `bench/agent.sh` (an agent's search session, ffs vs ripgrep),
+  `bench/h2h.sh` (matched thread counts) and the rest of `bench/`, with tools
+  found through `bench/tools.sh`.
+
+Builds for Windows and Intel macOS are untested.

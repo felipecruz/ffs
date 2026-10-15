@@ -87,7 +87,7 @@ jobs:
           tests/docs.sh zig-out-pcre/release/ffs
 
       - name: C library smoke test
-        # Guards the Linux-only hang fixed in 0.0.9: libffs.a without libc
+        # Guards a Linux-only hang found before 0.0.8: libffs.a without libc
         # made ffs_search block forever, so a timeout is the assertion.
         timeout-minutes: 5
         shell: bash
