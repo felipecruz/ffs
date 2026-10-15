@@ -1,0 +1,312 @@
+.Dd October 15, 2026
+.Dt FFS 1
+.Os
+.Sh NAME
+.Nm ffs
+.Nd search files for a pattern, with ripgrep's command line
+.Sh SYNOPSIS
+.Nm
+.Op Ar options
+.Ar pattern
+.Op Ar path ...
+.Nm
+.Op Ar options
+.Fl e Ar pattern ...
+.Op Ar path ...
+.Nm
+.Fl -files
+.Op Ar options
+.Op Ar path ...
+.Sh DESCRIPTION
+.Nm
+prints the lines of files that match
+.Ar pattern ,
+a regular expression.
+Its options and output are those of
+.Xr rg 1
+for the options it has, so it can stand in for ripgrep in scripts and in
+what coding agents run.
+.Pp
+Each
+.Ar path
+is a directory, searched recursively, a file, or
+.Sq -
+for standard input.
+With no
+.Ar path ,
+.Nm
+searches standard input if it is a pipe or a file, and the current directory
+otherwise.
+.Pp
+Searching a directory skips hidden files and directories (names starting
+with a dot), files that
+.Pa .gitignore ,
+.Pa .ignore
+or
+.Pa .rgignore
+files list, binary files (any file with a NUL byte), and symbolic links.
+Files named on the command line are always searched.
+.Pp
+Output lines look like
+.Ql path:line:text .
+The path is left out when the only path is a file or standard input, and the
+line number is printed with
+.Fl n ,
+or by default when standard output is a terminal.
+The order of files in the output is not fixed.
+.Ss Patterns
+.Bl -tag -width Ds
+.It Fl e Ar pattern , Fl -regexp Ns = Ns Ar pattern
+Search for
+.Ar pattern .
+Repeat to search for lines matching any of several patterns.
+With
+.Fl e ,
+no positional
+.Ar pattern
+is taken.
+.It Fl F , Fl -fixed-strings
+Treat patterns as literal text, not regular expressions.
+.It Fl i , Fl -ignore-case
+Match ASCII letters regardless of case.
+.It Fl S , Fl -smart-case
+Ignore case unless a pattern contains an upper-case letter.
+.It Fl s , Fl -case-sensitive
+Match case exactly (the default).
+.It Fl w , Fl -word-regexp
+Only match whole words, as with
+.Ql \eb
+around the pattern.
+.It Fl x , Fl -line-regexp
+Only match whole lines.
+.It Fl v , Fl -invert-match
+Print the lines that do not match.
+.El
+.Ss Output
+.Bl -tag -width Ds
+.It Fl n , Fl -line-number
+Print line numbers.
+.It Fl N , Fl -no-line-number
+Do not print line numbers.
+.It Fl H , Fl -with-filename
+Print the path on every line, even for a single file.
+.It Fl I , Fl -no-filename
+Never print the path.
+.It Fl o , Fl -only-matching
+Print each match on its own line instead of the whole line.
+.It Fl c , Fl -count
+Print the number of matching lines in each file that has any, as
+.Ql path:count .
+.It Fl l , Fl -files-with-matches
+Print only the paths of files with a match.
+.It Fl q , Fl -quiet
+Print nothing, and stop at the first match.
+The exit status says whether anything matched.
+.It Fl m Ar num , Fl -max-count Ns = Ns Ar num
+Stop reading a file after
+.Ar num
+matching lines.
+.It Fl A Ar num , Fl -after-context Ns = Ns Ar num
+Also print
+.Ar num
+lines after each match.
+.It Fl B Ar num , Fl -before-context Ns = Ns Ar num
+Also print
+.Ar num
+lines before each match.
+.It Fl C Ar num , Fl -context Ns = Ns Ar num
+Both of the above.
+Context lines use
+.Ql -
+instead of
+.Ql \&:
+after the path and line number, and
+.Ql --
+separates groups of lines that are not next to each other.
+.It Fl -color Ns = Ns Ar when , Fl -colour Ns = Ns Ar when , Fl -heading , Fl -no-heading , Fl -no-messages
+Accepted for compatibility and ignored:
+.Nm
+prints no colors and no headings.
+.El
+.Ss Files
+.Bl -tag -width Ds
+.It Fl -files
+Print the files that would be searched, without searching them.
+No
+.Ar pattern
+is taken.
+.It Fl g Ar glob , Fl -glob Ns = Ns Ar glob
+Only search files matching
+.Ar glob ;
+with a leading
+.Ql \&! ,
+leave out files and directories matching it.
+Globs use
+.Pa .gitignore
+syntax
+.Pf ( Ql * ,
+.Ql ** ,
+.Ql \&? ,
+.Ql [a-z] ,
+.Ql {a,b} )
+and match the path as printed.
+A glob without a
+.Ql /
+matches the file name at any depth.
+A glob that matches a path takes precedence over ignore files and the
+hidden-file rule.
+Repeat for several globs; the last one that matches decides.
+.It Fl \&. , Fl -hidden
+Also search hidden files and directories.
+.It Fl -no-hidden
+Skip hidden files and directories (the default).
+.It Fl -no-ignore
+Do not use ignore files.
+.It Fl -no-ignore-vcs
+Do not use
+.Pa .gitignore
+and
+.Pa .git/info/exclude ,
+but still use
+.Pa .ignore
+and
+.Pa .rgignore .
+.It Fl u , Fl -unrestricted
+Once:
+.Fl -no-ignore .
+Twice:
+also
+.Fl -hidden .
+Three times: also
+.Fl -text .
+.It Fl a , Fl -text
+Search binary files as if they were text.
+.It Fl d Ar num , Fl -max-depth Ns = Ns Ar num , Fl -maxdepth Ns = Ns Ar num
+Descend at most
+.Ar num
+directory levels; files directly in a
+.Ar path
+are at depth 1.
+.El
+.Ss Other
+.Bl -tag -width Ds
+.It Fl j Ar num , Fl -threads Ns = Ns Ar num
+Use
+.Ar num
+worker threads, or
+.Cm auto
+(the default): the number of performance cores on Apple silicon, every
+logical CPU elsewhere.
+.It Fl h , Fl -help
+Print a summary of the options.
+.It Fl V , Fl -version
+Print the version.
+.El
+.Pp
+Options may come before or after the pattern and paths, and short options
+combine
+.Pf ( Fl nA5
+is
+.Fl n Fl A Cm 5 ) .
+.Fl -
+ends the options.
+.Sh PATTERN SYNTAX
+Patterns are matched against one line at a time, byte by byte; a pattern
+cannot contain a newline.
+.Bl -tag -width "e{n,m}" -compact
+.It Ar x
+the byte
+.Ar x ;
+.Ql \e Ns Ar x
+is
+.Ar x
+literally for any punctuation
+.It Li \&.
+any byte
+.It Li [abc] [^a-z]
+one byte from a class, or not;
+.Ql \ed \ew \es
+and
+.Ql [:alpha:]
+etc. work inside classes
+.It Li \ed \ew \es
+an ASCII digit, word byte
+.Pf ( Ql [0-9A-Za-z_] ) ,
+or white space;
+.Ql \eD \eW \eS
+are the complements
+.It Li \et \er \exNN
+tab, carriage return, a byte in hex
+.It Li \eb
+a word boundary
+.It Li ^ $
+the start and end of the line
+.It Li * + \&?
+zero or more, one or more, zero or one; a trailing
+.Ql \&?
+makes them lazy
+.It Li {n} {n,} {n,m}
+counted repetition
+.It Li a|b
+either
+.It Li (...) (?:...)
+a group
+.It Li (?i)
+ignore case from here to the end of the group
+.El
+.Sh EXIT STATUS
+.Bl -tag -width Ds -compact
+.It 0
+Something matched (with
+.Fl -files ,
+some file was listed).
+.It 1
+Nothing matched.
+.It 2
+An error: an unknown option, an invalid pattern, or a path that could not
+be read.
+The other paths are still searched, and the error is printed to standard
+error.
+.El
+.Sh EXAMPLES
+List the build files and READMEs near the top of a project:
+.Dl $ ffs --files -g '*README*' -g Makefile -d 2
+.Pp
+Look for any of several names, with line numbers:
+.Dl $ ffs -n 'dictFind|dictAdd|dictDelete' src
+.Pp
+Read a function body:
+.Dl $ ffs -n -A20 '^dictEntry \e*dictFind\e(' src/dict.c
+.Pp
+Count matching lines per file and show the top three:
+.Dl $ ffs -c 'serverLog\e(LL_WARNING' src | sort -t: -k2 -rn | head -3
+.Pp
+Search the output of a build:
+.Dl $ make 2>&1 | ffs 'error:|warning:'
+.Sh SEE ALSO
+.Xr grep 1 ,
+.Xr rg 1
+.Pp
+The
+.Pa docs
+folder of the source repository has a page per topic, with examples.
+.Sh CAVEATS
+.Fl i
+and
+.Ql \ew
+are ASCII only.
+.Ql \eb
+treats non-ASCII letters as word characters, as ripgrep does.
+A file with a NUL byte is skipped entirely, where ripgrep prints the
+matches before the NUL.
+Not supported: file types
+.Pq Fl t ,
+sorting, JSON output, replacement
+.Pq Fl r ,
+multi-line search
+.Pq Fl U ,
+following symbolic links
+.Pq Fl L ,
+PCRE syntax
+.Pq Fl P ,
+and the global git ignore file.

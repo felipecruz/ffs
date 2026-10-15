@@ -2,6 +2,59 @@
 
 ## 0.0.9 — unreleased
 
+**Breaking: the command line is now ripgrep's**, so ffs can stand in for
+`rg` in what coding agents run (SEARCH_CMDs.md).
+`ffs <folder> <term>` is now `ffs PATTERN [PATH...]`; `-E` and `--content`
+are gone (PATTERN is a regex, and `-n` prints `path:line:content`).
+
+- PATTERN is a regex by default; one with no regex syntax still goes
+  straight to the SIMD search, so literal searches cost what they did.
+  `-F`, `-e` (several patterns), `-w`, `-x`, `-S`, `-s`.
+- Paths: any number of files and directories, `-` for standard input, and
+  standard input by default when something is piped in. No path: the
+  current directory, printed without `./`.
+- ripgrep's defaults: hidden files and whatever `.gitignore` (inside a git
+  repository), `.ignore`, `.rgignore` and `.git/info/exclude` list are
+  skipped, including ignore files in the directories above the search
+  root. `--hidden`, `--no-ignore`, `--no-ignore-vcs`, `-u`/`-uu`/`-uuu`.
+  On the Linux kernel fixture the default search is still 79 ms, against
+  100 ms for ripgrep's default.
+- `--files`, `-g`/`--glob` (gitignore syntax, `**`, `{a,b}`, `!` to
+  exclude), `-d`/`--max-depth`.
+- Output modes: `-n`/`-N`, `-H`/`-I`, `-o`, `-c`, `-l`, `-q`, `-m`, `-v`,
+  `-A`/`-B`/`-C` (with ripgrep's `-` and `--` separators), `-a`.
+- Exit status as in ripgrep: 0 on a match, 1 on none, 2 on an error (a
+  missing path is reported and the other paths are still searched).
+- Regex: `(?:...)`, `(?i)`, lazy `*?` `+?` `??`, `\r`, `\xNN`, POSIX classes
+  (`[[:alpha:]]`), and `\b` sees UTF-8 characters, as in ripgrep.
+- Regex prefilter for alternations, the most common shape of agent search
+  (`a|b|c`): every match must contain one of a set of up to 16 literals,
+  and a new SIMD loop (`match.findLinesAny`) finds the lines that contain
+  any of them. When the regex is nothing but those literals, the VM is
+  skipped. `PM_RESUME|ERR_PTR|dictFind` on the Linux kernel fixture: 1.18 s
+  to 106 ms (ripgrep: 124 ms).
+- Optional PCRE2 build, `zig build -Dpcre2=true` (links the system's
+  libpcre2-8). Patterns are still parsed and validated by regex.zig; PCRE2's
+  JIT replaces the Pike VM for candidate lines, `-o` and whole-buffer scans
+  of regexes with no literal. Kernel fixture: `[0-9a-f]{16}` 1,382 to
+  392 ms (ripgrep 296), `spin_lock|mutex_lock|struct [a-z]+_ops` 261 to
+  123 ms (ripgrep 140). Patterns with `\b` keep the VM, whose `\b` sees
+  UTF-8 as ripgrep's does.
+- Docs: `docs/` has a page per topic (patterns, files, output, ripgrep),
+  about 30 examples and a man page, `docs/ffs.1`, installed by `zig build`
+  to `share/man/man1`. New `tests/docs.sh` runs every example inside the
+  Redis 8.0.2 source and checks its output, and checks that every flag is
+  in the man page and in `--help`; `--update` rewrites the outputs. CI
+  fetches Redis to run it. It found `--no-hidden` missing from `--help`.
+  `.github/workflows/pages.yml` publishes `docs/` as a GitHub Pages site
+  (Just the Docs theme, with search), the man page included.
+- New `bench/agent.sh`: 15 agent-style calls on the Redis source, each
+  timed against ripgrep with identical output required; the table is in
+  the README. ffs is faster on 14 of them and 2.4x slower on a regex with
+  no literal.
+- New `tests/compat.sh`: about 100 command lines run through ffs and
+  ripgrep, comparing output and exit status; run in CI on Linux and macOS.
+
 Measured on Linux for the first time (AMD Ryzen 9 PRO 6950H, 16 threads,
 Omarchy/Arch): see EXPERIMENTS.md, Experiment 15.
 

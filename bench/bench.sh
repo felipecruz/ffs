@@ -11,8 +11,8 @@ FIX="${2:-fixtures/redis}"
 
 zig build
 
-# 1) Each tool with its default behavior (rg and ack skip .git, grep and ffs don't)
-set -- -n ffs "$FFS $FIX $TERM_" -n rg "$RG -n $TERM_ $FIX"
+# 1) Each tool with its default behavior (ffs, rg and ack skip hidden and ignored files; grep doesn't)
+set -- -n ffs "$FFS -n $TERM_ $FIX" -n rg "$RG -n $TERM_ $FIX"
 if [ -n "$ACK" ]; then set -- "$@" -n ack "$ACK $TERM_ $FIX"; fi
 set -- "$@" -n grep "$GREP -rn $TERM_ $FIX"
 "$H" -N --warmup 5 --min-runs 30 \
@@ -21,7 +21,7 @@ set -- "$@" -n grep "$GREP -rn $TERM_ $FIX"
 
 # 2) Same work: all text files, nothing ignored (.git, hidden, .gitignore'd
 #    files are searched); binary files (containing NUL) are skipped.
-set -- -n ffs "$FFS $FIX $TERM_" -n 'ffs -j1' "$FFS -j1 $FIX $TERM_" \
+set -- -n ffs "$FFS -uu -n $TERM_ $FIX" -n 'ffs -j1' "$FFS -uu -n -j1 $TERM_ $FIX" \
        -n 'rg -uu' "$RG -uu -n $TERM_ $FIX"
 if [ -n "$ACK" ]; then
   set -- "$@" -n 'ack --ignore-ack-defaults' "$ACK --ignore-ack-defaults --noenv $TERM_ $FIX"

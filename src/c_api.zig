@@ -48,8 +48,8 @@ pub export fn ffs_search(
 
     var state: State = .{ .gpa = gpa, .root = root_path, .cb = cb orelse return FFS_EARG, .ctx = ctx };
     defer state.buf.deinit(gpa);
-    search.run(gpa, .{
-        .root_path = root_path,
+    _ = search.run(gpa, .{
+        .paths = &.{root_path},
         .term = t,
         .jobs = if (threads == 0) search.autoJobs() else threads,
         .ignore_case = ignore_case,

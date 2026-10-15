@@ -12,7 +12,10 @@
 //! handed off and the walk is exactly depth-first.
 //!
 //! Symlinks and special files are skipped; unreadable directories are skipped
-//! silently.
+//! silently. A `Filter` leaves out more, as ripgrep does by default: hidden
+//! entries, paths matched by ignore files, `-g` globs and a maximum depth.
+//! Each directory item carries the ignore rules that apply to it, as a chain
+//! of `IgnoreDir`s from the innermost directory with an ignore file outward.
 //!
 //! The walker knows nothing about what is done with a file. A visitor is any
 //! struct with:
@@ -28,6 +31,7 @@
 
 const std = @import("std");
 const Io = std.Io;
+const glob = @import("glob.zig");
 
 /// Files per handed-off batch: enough that the hand-off (one `openDir`, one
 /// name copy per file) is amortized, few enough that a directory of large
@@ -43,15 +47,45 @@ pub const File = struct {
     path: []const u8,
 };
 
+/// Which entries to leave out. The default leaves out nothing.
+pub const Filter = struct {
+    /// Visit entries whose name starts with '.'.
+    hidden: bool = true,
+    /// Honor .ignore and .rgignore files, in each directory and the root's
+    /// parents, and .gitignore and .git/info/exclude too inside a git repo.
+    ignore_files: bool = false,
+    /// With `ignore_files`: also the git ones.
+    vcs_ignore: bool = true,
+    /// `-g` globs. As in rg, they match the path as printed: `glob_prefix`
+    /// (the root as given, without "./"), a '/', and the path from the root.
+    globs: ?*const glob.RuleSet = null,
+    glob_prefix: []const u8 = "",
+    /// Entries deeper than this are left out; the root's entries are at depth 1.
+    max_depth: ?usize = null,
+};
+
+/// Ignore rules from the files in one directory. `parent` holds the rules of
+/// the next directory up that has any; rules nearer the file win.
+const IgnoreDir = struct {
+    parent: ?*const IgnoreDir,
+    /// The directory, relative to the walk root ("" for the root itself).
+    rel: []const u8,
+    /// For a directory above the root: the root's path relative to it.
+    above: ?[]const u8 = null,
+    rules: glob.RuleSet,
+};
+
 /// Walks every regular file under `root` (opened with `.iterate = true`) and
 /// calls `visitor.visitFile` for each, on `jobs` worker tasks. Returns when
 /// the whole tree has been walked.
-pub fn walk(io: Io, gpa: std.mem.Allocator, root: Io.Dir, visitor: anytype, jobs: usize) !void {
+pub fn walk(io: Io, gpa: std.mem.Allocator, root: Io.Dir, visitor: anytype, jobs: usize, filter: Filter) !void {
     const W = Walker(@typeInfo(@TypeOf(visitor)).pointer.child);
-    var w: W = .{ .io = io, .gpa = gpa, .root = root, .visitor = visitor };
+    var w: W = .{ .io = io, .gpa = gpa, .root = root, .visitor = visitor, .filter = filter, .arena = .init(gpa) };
     defer w.deinit();
 
-    try w.push(.{ .dir = "" }); // the root; the only item whose path is not owned
+    var top: Dir = .{ .rel = "" }; // the root; the only item whose path is not owned
+    if (filter.ignore_files) try w.loadAncestors(&top);
+    try w.push(.{ .dir = top });
 
     var group: Io.Group = .init;
     defer group.cancel(io);
@@ -67,6 +101,11 @@ fn Walker(comptime Visitor: type) type {
         gpa: std.mem.Allocator,
         root: Io.Dir,
         visitor: *Visitor,
+        filter: Filter,
+        /// `IgnoreDir`s, for the whole walk. Guarded by `mutex`.
+        arena: std.heap.ArenaAllocator,
+        /// The root holds .git.
+        root_is_repo: bool = false,
 
         mutex: Io.Mutex = .init,
         /// Signaled when an item is queued, and broadcast when the last one
@@ -83,8 +122,7 @@ fn Walker(comptime Visitor: type) type {
         idle: std.atomic.Value(usize) = .init(0),
 
         const Item = union(enum) {
-            /// Directory to read, relative to root ("" for the root itself).
-            dir: []const u8,
+            dir: Dir,
             /// Files to visit, all in the same directory.
             files: struct { rel: []const u8, names: []const []const u8 },
         };
@@ -92,11 +130,12 @@ fn Walker(comptime Visitor: type) type {
         fn deinit(w: *Self) void {
             for (w.items.items) |item| w.freeItem(item);
             w.items.deinit(w.gpa);
+            w.arena.deinit();
         }
 
         fn freeItem(w: *Self, item: Item) void {
             switch (item) {
-                .dir => |rel| w.freeRel(rel),
+                .dir => |d| w.freeRel(d.rel),
                 .files => |f| {
                     for (f.names) |name| w.gpa.free(name);
                     w.gpa.free(f.names);
@@ -159,7 +198,7 @@ fn Walker(comptime Visitor: type) type {
 
         fn itemPath(_: *Self, item: Item) []const u8 {
             const rel = switch (item) {
-                .dir => |d| d,
+                .dir => |d| d.rel,
                 .files => |f| f.rel,
             };
             return if (rel.len == 0) "." else rel;
@@ -167,25 +206,59 @@ fn Walker(comptime Visitor: type) type {
 
         fn process(w: *Self, local: *Visitor.Local, item: Item) !void {
             switch (item) {
-                .dir => |rel| try w.readDir(local, rel),
+                .dir => |d| try w.readDir(local, d),
                 .files => |f| try w.visitFiles(local, f.rel, f.names),
             }
         }
 
-        fn readDir(w: *Self, local: *Visitor.Local, rel: []const u8) !void {
+        fn readDir(w: *Self, local: *Visitor.Local, d: Dir) !void {
+            const rel = d.rel;
             var dir = w.root.openDir(w.io, if (rel.len == 0) "." else rel, .{ .iterate = true }) catch return;
             defer dir.close(w.io);
+
+            var sub: Dir = .{ .rel = undefined, .ign = d.ign, .git = d.git, .depth = d.depth + 1 };
+            if (w.filter.ignore_files) {
+                // A repository inside the tree starts using its git ignores here.
+                const repo_root = (rel.len == 0 and w.root_is_repo) or
+                    (!d.git and w.filter.vcs_ignore and exists(w.io, dir, ".git"));
+                sub.git = sub.git or repo_root;
+                sub.ign = try w.loadIgnores(dir, .{ .rel = rel, .git = sub.git, .repo_root = repo_root }, sub.ign);
+            }
+            const max_depth = w.filter.max_depth orelse std.math.maxInt(usize);
+            const check_path = sub.ign != null or w.filter.globs != null;
 
             var handoff: std.ArrayList([]const u8) = .empty; // names for an idle worker
             defer w.freeNames(&handoff);
 
             var path: std.ArrayList(u8) = .empty; // "<rel>/<name>"
             defer path.deinit(w.gpa);
+            var glob_path: std.ArrayList(u8) = .empty; // "<glob_prefix>/<rel>/<name>"
+            defer glob_path.deinit(w.gpa);
 
             var it = dir.iterate();
             while (it.next(w.io) catch return) |entry| {
+                if (entry.kind != .directory and entry.kind != .file) continue;
+                const is_dir = entry.kind == .directory;
+                if (sub.depth > max_depth or (is_dir and sub.depth == max_depth)) continue;
+                if (check_path) try setPath(w.gpa, &path, rel, entry.name);
+                // As in rg, the first that has a say decides: a glob, then
+                // the ignore files, then the hidden check. So a matching
+                // glob or a '!' line beats a leading dot.
+                filter: {
+                    if (w.filter.globs) |g| switch (g.decide(try w.globPath(&glob_path, path.items), is_dir)) {
+                        .ignore => continue,
+                        .include => break :filter,
+                        .none => if (!is_dir and g.any_include) continue,
+                    };
+                    if (sub.ign) |ign| switch (ignored(ign, path.items, is_dir)) {
+                        .ignore => continue,
+                        .include => break :filter,
+                        .none => {},
+                    };
+                    if (!w.filter.hidden and entry.name[0] == '.') continue;
+                }
                 switch (entry.kind) {
-                    .directory => try w.pushDir(rel, entry.name),
+                    .directory => try w.pushDir(sub, rel, entry.name),
                     .file => if (w.idle.load(.monotonic) > 0) {
                         try handoff.append(w.gpa, try w.gpa.dupe(u8, entry.name));
                         if (handoff.items.len >= batch_len) try w.pushFiles(rel, &handoff);
@@ -218,19 +291,115 @@ fn Walker(comptime Visitor: type) type {
             path: *std.ArrayList(u8),
             file_name: []const u8,
         ) !void {
-            path.clearRetainingCapacity();
-            if (rel.len > 0) {
-                try path.appendSlice(w.gpa, rel);
-                try path.append(w.gpa, '/');
-            }
-            try path.appendSlice(w.gpa, file_name);
+            try setPath(w.gpa, path, rel, file_name);
             try w.visitor.visitFile(local, .{ .dir = dir, .name = file_name, .path = path.items });
         }
 
-        fn pushDir(w: *Self, rel: []const u8, child_name: []const u8) !void {
-            const child = try joinPath(w.gpa, rel, child_name);
-            errdefer w.gpa.free(child);
+        fn pushDir(w: *Self, sub: Dir, rel: []const u8, child_name: []const u8) !void {
+            var child = sub;
+            child.rel = try joinPath(w.gpa, rel, child_name);
+            errdefer w.gpa.free(child.rel);
             try w.push(.{ .dir = child });
+        }
+
+        fn globPath(w: *Self, buf: *std.ArrayList(u8), path: []const u8) ![]const u8 {
+            if (w.filter.glob_prefix.len == 0) return path;
+            try setPath(w.gpa, buf, w.filter.glob_prefix, path);
+            return buf.items;
+        }
+
+        // What the ignore files say about `path` (relative to the root): the
+        // innermost directory with a matching rule decides.
+        fn ignored(chain: *const IgnoreDir, path: []const u8, is_dir: bool) glob.Decision {
+            var node: ?*const IgnoreDir = chain;
+            var buf: [std.fs.max_path_bytes]u8 = undefined;
+            while (node) |n| : (node = n.parent) {
+                const local = if (n.above) |above|
+                    std.fmt.bufPrint(&buf, "{s}/{s}", .{ above, path }) catch continue
+                else if (n.rel.len == 0) path else path[n.rel.len + 1 ..];
+                const d = n.rules.decide(local, is_dir);
+                if (d != .none) return d;
+            }
+            return .none;
+        }
+
+        // Reads the ignore files in `dir` and returns the chain to use below
+        // it: a new `IgnoreDir` on top of `parent`, or `parent` if there are
+        // none. In a repository root, .git/info/exclude is read first, so it
+        // loses to the rest.
+        fn loadIgnores(w: *Self, dir: Io.Dir, at: Location, parent: ?*const IgnoreDir) !?*const IgnoreDir {
+            const vcs = at.git and w.filter.vcs_ignore;
+            const names = [_][]const u8{ ".git/info/exclude", ".gitignore", ".ignore", ".rgignore" };
+            var contents: [names.len]?[]u8 = @splat(null);
+            defer for (contents) |c| if (c) |bytes| w.gpa.free(bytes);
+            var any = false;
+            for (names, 0..) |name, k| {
+                if (k == 0 and !(vcs and at.repo_root)) continue;
+                if (k == 1 and !vcs) continue;
+                contents[k] = dir.readFileAlloc(w.io, name, w.gpa, .limited(1 << 20)) catch null;
+                any = any or contents[k] != null;
+            }
+            if (!any) return parent;
+
+            w.mutex.lockUncancelable(w.io);
+            defer w.mutex.unlock(w.io);
+            const a = w.arena.allocator();
+            const node = try a.create(IgnoreDir);
+            node.* = .{
+                .parent = parent,
+                .rel = try a.dupe(u8, at.rel),
+                .above = if (at.above) |above| try a.dupe(u8, above) else null,
+                .rules = .{},
+            };
+            for (contents) |c| if (c) |bytes| try node.rules.addIgnoreFile(a, bytes);
+            return node;
+        }
+
+        const Location = struct {
+            rel: []const u8 = "",
+            above: ?[]const u8 = null,
+            git: bool,
+            repo_root: bool = false,
+        };
+
+        // The ignore files of the directories above the root: .ignore and
+        // .rgignore all the way up, the git ones up to the repository root.
+        fn loadAncestors(w: *Self, top: *Dir) !void {
+            var real_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const real = real_buf[0 .. w.root.realPath(w.io, &real_buf) catch return];
+            w.root_is_repo = exists(w.io, w.root, ".git");
+
+            // Ancestors, nearest first, with the nearest one holding .git.
+            var ancestors: std.ArrayList([]const u8) = .empty;
+            defer ancestors.deinit(w.gpa);
+            var p: []const u8 = real;
+            while (std.fs.path.dirname(p)) |parent| : (p = parent) try ancestors.append(w.gpa, parent);
+            var repo: ?usize = null;
+            if (!w.root_is_repo) for (ancestors.items, 0..) |anc, k| {
+                var d = Io.Dir.openDirAbsolute(w.io, anc, .{}) catch continue;
+                defer d.close(w.io);
+                if (exists(w.io, d, ".git")) {
+                    repo = k;
+                    break;
+                }
+            };
+            top.git = w.root_is_repo or repo != null;
+
+            // Outermost first, so each node's parent is the one above it.
+            var chain: ?*const IgnoreDir = null;
+            var k = ancestors.items.len;
+            while (k > 0) {
+                k -= 1;
+                const anc = ancestors.items[k];
+                var d = Io.Dir.openDirAbsolute(w.io, anc, .{}) catch continue;
+                defer d.close(w.io);
+                chain = try w.loadIgnores(d, .{
+                    .above = std.mem.trimStart(u8, real[anc.len..], "/"),
+                    .git = if (repo) |r| k <= r else false,
+                    .repo_root = repo == k,
+                }, chain);
+            }
+            top.ign = chain;
         }
 
         // Hands `names` to the queue; leaves it empty, ready to refill.
@@ -250,6 +419,33 @@ fn Walker(comptime Visitor: type) type {
             names.deinit(w.gpa);
         }
     };
+}
+
+/// A directory to read.
+const Dir = struct {
+    /// Relative to root ("" for the root itself).
+    rel: []const u8,
+    /// Ignore rules that apply inside it, from the directories above.
+    ign: ?*const IgnoreDir = null,
+    /// Inside a git repository: .gitignore files count.
+    git: bool = false,
+    /// The root is at depth 0.
+    depth: usize = 0,
+};
+
+fn exists(io: Io, dir: Io.Dir, name: []const u8) bool {
+    _ = dir.statFile(io, name, .{ .follow_symlinks = false }) catch return false;
+    return true;
+}
+
+// path = "<rel>/<name>", or just name at the root.
+fn setPath(gpa: std.mem.Allocator, path: *std.ArrayList(u8), rel: []const u8, name: []const u8) !void {
+    path.clearRetainingCapacity();
+    if (rel.len > 0) {
+        try path.appendSlice(gpa, rel);
+        try path.append(gpa, '/');
+    }
+    try path.appendSlice(gpa, name);
 }
 
 fn joinPath(gpa: std.mem.Allocator, dir: []const u8, name: []const u8) ![]u8 {

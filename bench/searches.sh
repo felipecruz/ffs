@@ -22,7 +22,7 @@ printf '%s\n' "$QUERIES" | while IFS='|' read -r slug term; do
   # Fast tools get many runs within hyperfine's default time budget; slow
   # ones (ack, grep) get at least 5. -i: rg, ack and grep exit 1 when nothing
   # matches (the "none" query); correctness is checked separately.
-  set -- -n ffs "$FFS $FIX '$term'" -n 'ffs -j1' "$FFS -j1 $FIX '$term'" \
+  set -- -n ffs "$FFS -uu -n -F -- '$term' $FIX" -n 'ffs -j1' "$FFS -uu -n -F -j1 -- '$term' $FIX" \
          -n 'rg -uu' "$RG -uu -n -F -- '$term' $FIX"
   if [ -n "$ACK" ]; then
     set -- "$@" -n 'ack --ignore-ack-defaults' "$ACK --ignore-ack-defaults --noenv -Q -- '$term' $FIX"

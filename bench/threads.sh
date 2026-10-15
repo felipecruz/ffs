@@ -31,21 +31,21 @@ done
 
 "$H" -N --warmup 3 --min-runs 10 \
   --export-json "$OUT/threads-redis.json" \
-  -L j "$JS" "$FFS -j {j} fixtures/redis dictFind"
+  -L j "$JS" "$FFS -uu -n -F -j {j} dictFind fixtures/redis"
 
 "$H" -N --warmup 3 --min-runs 10 \
   --export-json "$OUT/threads-linux.json" \
-  -L j "$JS" "$FFS -j {j} fixtures/linux PM_RESUME"
+  -L j "$JS" "$FFS -uu -n -F -j {j} PM_RESUME fixtures/linux"
 
 # Fairness check: ripgrep with the same thread caps.
 "$H" -N -i --warmup 3 --min-runs 10 \
   --export-json "$OUT/linux-rg-threads.json" \
-  -n ffs          "$FFS fixtures/linux PM_RESUME" \
+  -n ffs          "$FFS -uu -n -F PM_RESUME fixtures/linux" \
   -n 'rg -uu -j4' "$RG -uu -j4 -n -F PM_RESUME fixtures/linux" \
   -n 'rg -uu -j2' "$RG -uu -j2 -n -F PM_RESUME fixtures/linux" \
   -n 'rg -uu'     "$RG -uu -n -F PM_RESUME fixtures/linux"
 
 "$H" -N --warmup 3 --min-runs 30 \
   --export-json "$OUT/redis-rg-threads.json" \
-  -n ffs          "$FFS fixtures/redis dictFind" \
+  -n ffs          "$FFS -uu -n -F dictFind fixtures/redis" \
   -n 'rg -uu -j4' "$RG -uu -j4 -n dictFind fixtures/redis"
