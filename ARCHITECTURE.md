@@ -8,12 +8,14 @@ file's bytes: the 16-byte SIMD loop in `src/match.zig`. Measurements are in
 
 | File | Responsibility |
 |---|---|
-| `src/main.zig` | Command line; calls `search.run` |
-| `src/walk.zig` | Parallel recursive directory walk (worker pool over one queue); knows nothing about searching |
-| `src/search.zig` | `run`: thread pool, walk; per-file work: open, read (streaming), binary check, output |
+| `src/main.zig` | ripgrep's command line; turns the patterns into one literal or regex, calls `search.run` |
+| `src/walk.zig` | Parallel recursive directory walk (worker pool over one queue), with ripgrep's filters: hidden, ignore files, `-g`, `--max-depth`; knows nothing about searching |
+| `src/glob.zig` | Globs and gitignore rule sets, for `-g` and ignore files |
+| `src/search.zig` | `run`: paths (directories, files, stdin), thread pool, walk; per-file work: open, read (streaming, or whole for context lines and `-v`), binary check, ripgrep's output modes |
 | `src/c_api.zig` | C ABI (`include/ffs.h`): `ffs_search` with a callback, over `search.run` |
 | `src/match.zig` | Finding the term in bytes (SIMD), with no I/O; naive reference and randomized test |
-| `src/regex.zig` | `-E`: regex parser, compiler and Pike VM, behind the SIMD search as a prefilter |
+| `src/pcre.zig` | With `-Dpcre2=true`: PCRE2's JIT replaces the Pike VM for line checks, `-o` and buffers with no literal; patterns with `\b` stay on the VM |
+| `src/regex.zig` | Regex parser, compiler and Pike VM, behind the SIMD search as a prefilter; `Vm.find` gives match positions for `-o` |
 | `src/bench_match.zig` | Matcher microbenchmark (`bench/match.sh`, EXPERIMENTS.md, Experiment 8) |
 
 The layers connect through two small interfaces that are resolved at compile
@@ -287,10 +289,9 @@ masks. It was 7% slower.
 1. `indexOfScalarPos(data, pos, '\n')` (SIMD) finds the end of the line.
 2. `sink.onLine(m)` is called with a `Match` (`match.zig:16`): `line`,
    `data`, `pos` (where the term starts) and `end` (the line's `\n`, or
-   `data.len`). In ffs the sink prints `<root>/<path>:<line>` into the
-   file's output buffer. With `--content` it prints
-   `<root>/<path>:<line>:<content>`, where the content comes from
-   `m.text()`.
+   `data.len`). In ffs the sink (`search.Printer`) prints
+   `<path>:<line>:<content>` into the file's output buffer, the content
+   coming from `m.text()`; `-c` and `-l` only count.
 3. If there was a newline, `line` goes up by 1 and the scan resumes at the
    start of the next line (`continue :outer`). Each line is therefore
    reported at most once, and the rest of a matching line is never scanned.
@@ -299,9 +300,9 @@ masks. It was 7% slower.
 `Match.text()` finds the line's start **on demand**, by scanning back from
 `pos` to the previous `\n` (`findScalarLast`, byte by byte), or to the
 start of `data`. That is always a line start, because `search.zig` cuts
-reads at newlines. The cost is paid only by sinks that call it, so the
-default `path:line` output does no extra work. Even with `--content`, the
-backward scan covers only the part of the line before the match.
+reads at newlines. The cost is paid only by sinks that call it, so `-c`
+and `-l` do no extra work. When it is called, the backward scan covers
+only the part of the line before the match.
 
 ### The tail (`match.zig:97`)
 
@@ -337,7 +338,7 @@ fold in the SIMD loop makes the first randomized test fail (verified).
 
 Run them with `zig build test`.
 
-## Regex (`-E`, `src/regex.zig`)
+## Regex (`src/regex.zig`)
 
 A regex search is a literal search plus a filter:
 
