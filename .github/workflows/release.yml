@@ -75,7 +75,7 @@ jobs:
           cp dist/release/ffs* "out/$name/"
           cp dist/include/ffs.h "out/$name/"
           cp dist/lib/* "out/$name/"
-          cp README.md CHANGELOG.md "out/$name/"
+          cp README.md CHANGELOG.md docs/ffs.1 "out/$name/"
           cd out
           case "${{ matrix.target }}" in
             *windows) zip -qr "$name.zip" "$name"; echo "asset=out/$name.zip" >> "$GITHUB_OUTPUT" ;;
