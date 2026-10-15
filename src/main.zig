@@ -445,6 +445,7 @@ const help =
     \\      --files             list the files that would be searched; no PATTERN
     \\  -g, --glob GLOB         search only files matching GLOB; !GLOB excludes
     \\  -., --hidden            search hidden files and directories too
+    \\      --no-hidden         skip hidden files and directories (the default)
     \\      --no-ignore         don't use .gitignore, .ignore or .rgignore files
     \\      --no-ignore-vcs     don't use .gitignore files
     \\  -u, --unrestricted      -u: --no-ignore; -uu: and --hidden; -uuu: and --text
