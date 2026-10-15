@@ -11,6 +11,10 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const options = b.addOptions();
     options.addOption([]const u8, "version", version);
+    // `-Dpcre2=true`: PCRE2's JIT does the regex VM's work (src/pcre.zig).
+    // Links the system's libpcre2-8, so the binary is no longer standalone.
+    const pcre2 = b.option(bool, "pcre2", "Use the system's PCRE2 JIT for regexes (default: false)") orelse false;
+    options.addOption(bool, "pcre2", pcre2);
 
     const variants = [_]struct { dir: []const u8, optimize: std.builtin.OptimizeMode, strip: bool }{
         .{ .dir = "debug", .optimize = .Debug, .strip = false },
@@ -29,6 +33,7 @@ pub fn build(b: *std.Build) void {
             }),
         });
         exe.root_module.addOptions("build_options", options);
+        if (pcre2) linkPcre2(exe.root_module);
         const install = b.addInstallArtifact(exe, .{
             .dest_dir = .{ .override = .{ .custom = v.dir } },
         });
@@ -53,6 +58,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     lib.root_module.addOptions("build_options", options);
+    if (pcre2) linkPcre2(lib.root_module);
     lib.bundle_compiler_rt = true;
     lib.installHeader(b.path("include/ffs.h"), "ffs.h");
     b.installArtifact(lib);
@@ -93,6 +99,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     tests.root_module.addOptions("build_options", options);
+    if (pcre2) linkPcre2(tests.root_module);
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);
 
@@ -103,4 +110,12 @@ pub fn build(b: *std.Build) void {
         .dest_dir = .{ .override = .{ .custom = "test" } },
     });
     b.step("test-bin", "Build the test binary without running it").dependOn(&test_bin.step);
+}
+
+// PCRE2 is a C library that calls malloc: without libc linked explicitly,
+// the program starts through Zig's own `_start` and libc is never set up,
+// so the first pcre2_compile crashes.
+fn linkPcre2(m: *std.Build.Module) void {
+    m.link_libc = true;
+    m.linkSystemLibrary("pcre2-8", .{});
 }

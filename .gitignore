@@ -1,6 +1,7 @@
 # Build output
 .zig-cache/
 zig-out/
+zig-out-pcre/
 
 # Benchmark corpora (2+ GB); see EXPERIMENTS.md, "Setup", to recreate them
 fixtures/

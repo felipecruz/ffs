@@ -28,6 +28,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const match = @import("match.zig");
+const pcre = @import("pcre.zig");
 
 pub const Error = error{
     OutOfMemory,
@@ -79,6 +80,9 @@ pub const Regex = struct {
     /// Bytes that can start a match, or null if a match can start with an
     /// assertion or be empty. Lets the VM skip bytes while no thread is alive.
     first: ?Set,
+    /// With `-Dpcre2`: the same pattern for PCRE2's JIT, which then does the
+    /// VM's work. Not for patterns with `\b`, which PCRE2 sees in ASCII only.
+    pcre: if (pcre.enabled) ?pcre.Pattern else void = if (pcre.enabled) null else {},
 
     pub fn compile(gpa: Allocator, pattern_arg: []const u8, ignore_case_arg: bool) Error!Regex {
         var arena: std.heap.ArenaAllocator = .init(gpa);
@@ -105,7 +109,12 @@ pub const Regex = struct {
         const first = try firstBytes(a, c.prog.items);
 
         // Copy the arena last: allocations after the copy would be lost.
+        const pcre_pattern = if (pcre.enabled) blk: {
+            for (c.prog.items) |inst| if (inst == .word_boundary) break :blk null;
+            break :blk pcre.Pattern.compile(pattern, ignore_case);
+        } else {};
         return .{
+            .pcre = pcre_pattern,
             .arena = arena,
             .prog = c.prog.items,
             .literals = literals,
@@ -116,6 +125,7 @@ pub const Regex = struct {
     }
 
     pub fn deinit(re: *Regex) void {
+        if (pcre.enabled) if (re.pcre) |p| p.deinit();
         re.arena.deinit();
     }
 };
@@ -125,7 +135,10 @@ pub const Regex = struct {
 pub fn findLines(re: *const Regex, vm: *Vm, data: []const u8, first_line: usize, sink: anytype) !usize {
     if (re.exact) return prefilter(re, data, first_line, sink);
     const filter: Filter(@TypeOf(sink)) = .{ .re = re, .vm = vm, .sink = sink };
-    if (re.literals.len == 0) return everyLine(data, first_line, filter);
+    if (re.literals.len == 0) {
+        if (pcre.enabled) if (re.pcre) |p| return pcreLines(p, vm.pcre.?, data, first_line, sink);
+        return everyLine(data, first_line, filter);
+    }
     return prefilter(re, data, first_line, filter);
 }
 
@@ -151,6 +164,30 @@ fn Filter(comptime Sink: type) type {
             if (f.vm.isMatch(f.re, m.text())) try f.sink.onLine(m);
         }
     };
+}
+
+// No literal, with PCRE2: let it scan the whole buffer. A match there may
+// run across a newline (`\s` and `[^a]` match '\n'), so one that does is
+// checked again on its first line alone. That can't skip a real match: any
+// match within a line is also a match in the buffer, so the scan stops at or
+// before it.
+fn pcreLines(p: pcre.Pattern, m: pcre.Matcher, data: []const u8, first_line: usize, sink: anytype) !usize {
+    var line = first_line;
+    var counted: usize = 0; // newlines before this offset are in `line`
+    var pos: usize = 0; // a line start
+    while (pos < data.len) {
+        const span = m.find(p, data, pos) orelse break;
+        if (span.start >= data.len) break; // an empty match after the last '\n'
+        const start = if (std.mem.findScalarLast(u8, data[pos..span.start], '\n')) |nl| pos + nl + 1 else pos;
+        const end = std.mem.indexOfScalarPos(u8, data, span.start, '\n') orelse data.len;
+        line += std.mem.countScalar(u8, data[counted..start], '\n');
+        counted = start;
+        if (span.end <= end or m.find(p, data[start..end], 0) != null) {
+            try sink.onLine(match.Match{ .line = line, .data = data, .pos = span.start, .end = end });
+        }
+        pos = end + 1;
+    }
+    return line + std.mem.countScalar(u8, data[counted..], '\n');
 }
 
 // No required literal: every line is a candidate.
@@ -611,12 +648,14 @@ pub const Vm = struct {
     seen: []usize, // seen[pc] == gen: pc already added at this position
     stack: []u32, // pcs to follow in `add`
     gen: usize = 0,
+    pcre: if (pcre.enabled) ?pcre.Matcher else void = if (pcre.enabled) null else {},
 
     pub fn init(gpa: Allocator, re: *const Regex) !Vm {
         const n = re.prog.len;
         const seen = try gpa.alloc(usize, n);
         @memset(seen, 0);
         return .{
+            .pcre = if (pcre.enabled) (if (re.pcre) |p| try pcre.Matcher.init(p) else null) else {},
             .clist = try gpa.alloc(u32, n),
             .nlist = try gpa.alloc(u32, n),
             .cstart = try gpa.alloc(usize, n),
@@ -627,6 +666,7 @@ pub const Vm = struct {
     }
 
     pub fn deinit(vm: *Vm, gpa: Allocator) void {
+        if (pcre.enabled) if (vm.pcre) |m| m.deinit();
         gpa.free(vm.clist);
         gpa.free(vm.nlist);
         gpa.free(vm.cstart);
@@ -639,6 +679,7 @@ pub const Vm = struct {
     /// at a time, starting a new thread at every position (skipping ahead
     /// with `first` while none is alive).
     pub fn isMatch(vm: *Vm, re: *const Regex, line: []const u8) bool {
+        if (pcre.enabled) if (re.pcre) |p| return vm.pcre.?.find(p, line, 0) != null;
         var n_cur: usize = 0;
         vm.gen += 1;
         var i: usize = 0;
@@ -667,6 +708,10 @@ pub const Vm = struct {
     /// continues past the first `match` while a preferred thread could still
     /// make the match longer.
     pub fn find(vm: *Vm, re: *const Regex, line: []const u8, from: usize) ?Span {
+        if (pcre.enabled) if (re.pcre) |p| {
+            const m = vm.pcre.?.find(p, line, from) orelse return null;
+            return .{ .start = m.start, .end = m.end };
+        };
         var found: ?Span = null;
         var n_cur: usize = 0;
         vm.gen += 1;
