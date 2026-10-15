@@ -40,6 +40,12 @@ are gone (PATTERN is a regex, and `-n` prints `path:line:content`).
   392 ms (ripgrep 296), `spin_lock|mutex_lock|struct [a-z]+_ops` 261 to
   123 ms (ripgrep 140). Patterns with `\b` keep the VM, whose `\b` sees
   UTF-8 as ripgrep's does.
+- Docs: `docs/` has a page per topic (patterns, files, output, ripgrep),
+  about 30 examples and a man page, `docs/ffs.1`, installed by `zig build`
+  to `share/man/man1`. New `tests/docs.sh` runs every example inside the
+  Redis 8.0.2 source and checks its output, and checks that every flag is
+  in the man page and in `--help`; `--update` rewrites the outputs. CI
+  fetches Redis to run it. It found `--no-hidden` missing from `--help`.
 - New `bench/agent.sh`: 15 agent-style calls on the Redis source, each
   timed against ripgrep with identical output required; the table is in
   the README. ffs is faster on 14 of them and 2.4x slower on a regex with

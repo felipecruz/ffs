@@ -30,9 +30,9 @@ $ ffs --files src | ffs -c '\.c$'
 119
 ```
 
-More, all with real output, in **[EXAMPLES.md](EXAMPLES.md)**: listing files
-with globs, reading function bodies, pulling out IDs, counting, exit
-statuses and pipelines.
+More in **[docs/](docs/README.md)**: a page per topic (patterns, which files
+get searched, output) and [about 30 examples](docs/examples.md), every one
+run and checked in CI, plus a man page.
 
 ## Results
 
@@ -185,9 +185,11 @@ the current directory, skipping hidden files and what `.gitignore`,
 `.ignore` and `.rgignore` list. Exit status: 0 on a match, 1 on none, 2 on
 an error.
 
-`zig build` puts the binary in `zig-out/release/ffs`. The output is
-ripgrep's format for a pipe (no colors, no headings; line numbers with
-`-n`, or by default on a terminal); the order is not deterministic.
+`zig build` puts the binary in `zig-out/release/ffs` and the man page in
+`zig-out/share/man/man1/ffs.1`. The output is ripgrep's format for a pipe
+(no colors, no headings; line numbers with `-n`, or by default on a
+terminal); the order is not deterministic. The full reference is
+[docs/](docs/README.md) and `man ffs`.
 
 From C:
 
@@ -256,8 +258,8 @@ there forever, because `libffs.a` was built without libc
 
 ## More
 
-- [EXAMPLES.md](EXAMPLES.md): about 30 searches agents run, with real
-  output.
+- [docs/](docs/README.md): how to use ffs, a page per topic, with tested
+  examples, and the man page.
 - [ARCHITECTURE.md](ARCHITECTURE.md): how the code works, the 16-byte loop
   and the regex engine.
 - [EXPERIMENTS.md](EXPERIMENTS.md): the full lab notebook, with 15

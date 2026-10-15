@@ -1,9 +1,10 @@
 # Examples
 
-Every example on this page was run for real: most against the Redis 8.0.2
-source (`fixtures/redis`, see EXPERIMENTS.md, "Setup"), a few in this
-repository. Output that runs long is cut with `...`. The commands are what
-you would type with `rg`, with `ffs` in its place: the output is the same.
+Searches agents run while finding their way around a repository, here the
+Redis 8.0.2 source, with their real output: `tests/docs.sh` runs every one
+of them and checks the output on every push. Lines can come out in another
+order, since ffs searches files in parallel; `...` marks a cut. Each command
+is what you would type with `rg`, with `ffs` in its place.
 
 Contents:
 
@@ -23,11 +24,11 @@ What agents do first in almost every job: list the files that matter instead of 
 $ ffs --files -g '*README*' -g Makefile -g AGENTS.md -d 2
 Makefile
 README.md
-tests/README.md
-src/Makefile
 modules/Makefile
+tests/README.md
 deps/Makefile
 deps/README.md
+src/Makefile
 ```
 
 **Instructions and CI config live in hidden folders, so add --hidden (Redis has no AGENTS.md)**
@@ -132,11 +133,12 @@ $ ffs -n -B2 -A3 'void serverLogRaw\(' src/server.c
 **Spelled-out case variants**
 
 ```console
-$ ffs -n 'lazyfree|lazyFree|LazyFree' src -g '*.h' | head -4
+$ ffs -n 'lazyfree|lazyFree|LazyFree' src -g '*.h'
 src/bio.h:43:void bioCreateLazyFreeJob(lazy_free_fn free_fn, int arg_count, ...);
 src/server.h:1142:    monotime lazyfreeStartTime;
 src/server.h:2198:    int lazyfree_lazy_eviction;
 src/server.h:2199:    int lazyfree_lazy_expire;
+...
 ```
 
 **Or ignore case**
@@ -188,10 +190,11 @@ $ ffs -n -e DICT_OK -e DICT_ERR src/dict.h
 **The whole repository, `.gitignore` respected**
 
 ```console
-$ ffs -n 'TODO' -g '!deps/**' | head -3
-utils/req-res-log-validator.py:61:    # TODO: for vector-sets module
+$ ffs -n 'TODO' -g '!deps/**'
 tests/test_helper.tcl:490:    # TODO: print the status, exit with the right exit code.
-tests/unit/memefficiency.tcl:521:            # TODO: Lower the threshold after defraging the ebuckets.
+tests/assets/test_cli_hint_suite.txt:28:# TODO: The following hints end with an unbalanced "]" which shouldn't be there.
+src/dict.h:66:    /* TODO: Add a 'keys_are_even' flag and use a similar optimization if that
+...
 ```
 
 ## Pulling facts out of documents
@@ -256,16 +259,16 @@ src/server.c:54
 $ ffs -l aeCreateFileEvent src
 src/ae.c
 src/ae.h
-src/bio.c
 src/iothread.c
+src/bio.c
+src/replication.c
 src/module.c
+src/sentinel.c
+src/tls.c
+src/server.c
 src/rdb.c
 src/redis-benchmark.c
-src/replication.c
-src/sentinel.c
-src/server.c
 src/socket.c
-src/tls.c
 ```
 
 **The first match per file only**
@@ -314,33 +317,37 @@ $ ffs --files src | ffs -c '\.c$'
 
 ```console
 $ ffs -l aeCreateFileEvent src | ffs -v '^src/ae'
-src/bio.c
 src/iothread.c
-src/module.c
-src/rdb.c
-src/redis-benchmark.c
+src/bio.c
 src/replication.c
+src/module.c
 src/sentinel.c
+src/tls.c
 src/server.c
 src/socket.c
-src/tls.c
+src/rdb.c
+src/redis-benchmark.c
 ```
 
-**Search git history**
+**Search another command's output**
 
 ```console
-$ git log --oneline | ffs -i 'linux|pool' | head -3
-7e72225 Merge pull request #1 from felipecruz/feature/linux_tests
-5081a1b README: lead with the Linux results
-f279c41 Linux: worker-pool walk, -j auto per machine, C library fix
+$ ls src/modules | ffs -n 'Makefile|\.c$'
+1:helloacl.c
+2:helloblock.c
+3:hellocluster.c
+4:hellodict.c
+5:hellohook.c
+6:hellotimer.c
+7:hellotype.c
+8:helloworld.c
+9:Makefile
 ```
 
-**Filter a build's output**
+**Search the files a first search found**
 
 ```console
-$ zig build --summary all 2>&1 | ffs -n 'install|compile' | head -4
-2:install success
-3:+- install ffs cached
-4:|  +- compile exe ffs debug native cached 6ms MaxRSS:36M
-6:+- install ffs cached
+$ ffs -l 'rewriteAppendOnlyFile' src | ffs -v 'aof'
+src/server.c
+src/server.h
 ```

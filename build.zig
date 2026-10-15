@@ -7,6 +7,7 @@ const version = "0.0.9";
 //   zig-out/debug/ffs     (Debug: safety checks, debug info)
 //   zig-out/release/ffs   (ReleaseFast: production)
 //   zig-out/lib/libffs.a  (ReleaseFast C library) + zig-out/include/ffs.h
+//   zig-out/share/man/man1/ffs.1
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const options = b.addOptions();
@@ -39,6 +40,9 @@ pub fn build(b: *std.Build) void {
         });
         b.getInstallStep().dependOn(&install.step);
     }
+
+    // `man ffs`, once zig-out/share/man is on MANPATH (or with --prefix).
+    b.installFile("docs/ffs.1", "share/man/man1/ffs.1");
 
     // The C library: src/c_api.zig behind include/ffs.h.
     //

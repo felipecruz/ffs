@@ -68,6 +68,14 @@ jobs:
           if [ "$RUNNER_OS" = Linux ]; then sudo apt-get install -y -qq ripgrep; else brew install ripgrep; fi
           tests/compat.sh zig-out/release/ffs
 
+      - name: Docs examples and flags (tests/docs.sh)
+        # Linux only: the examples' pipelines use GNU `wc` and `sort` output.
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          git clone -q --depth 1 --branch 8.0.2 https://github.com/redis/redis.git fixtures/redis
+          tests/docs.sh zig-out/release/ffs
+
       - name: PCRE2 build (tests and ripgrep compat)
         if: matrix.os == 'ubuntu-latest'
         shell: bash
@@ -76,6 +84,7 @@ jobs:
           zig build -Dpcre2=true --prefix zig-out-pcre
           zig build test -Dpcre2=true
           tests/compat.sh zig-out-pcre/release/ffs
+          tests/docs.sh zig-out-pcre/release/ffs
 
       - name: C library smoke test
         # Guards the Linux-only hang fixed in 0.0.9: libffs.a without libc
