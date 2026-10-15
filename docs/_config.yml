@@ -1,0 +1,28 @@
+# GitHub Pages: .github/workflows/pages.yml builds this folder into the docs
+# site with the Just the Docs theme. Page titles and order live here, not in
+# front matter, so the pages also read cleanly on GitHub.
+title: ffs
+description: Search files for a pattern, with ripgrep's command line.
+remote_theme: just-the-docs/just-the-docs@v0.12.0
+plugins:
+  - jekyll-remote-theme
+  - jekyll-relative-links
+relative_links:
+  enabled: true
+search_enabled: true
+heading_anchors: true
+aux_links:
+  ffs on GitHub: https://github.com/felipecruz/ffs
+aux_links_new_tab: true
+back_to_top: true
+footer_content: Every example on these pages is run and checked in CI (tests/docs.sh).
+exclude:
+  - ffs.1
+defaults:
+  - { scope: { path: README.md }, values: { title: Home, nav_order: 1, permalink: / } }
+  - { scope: { path: patterns.md }, values: { title: Patterns, nav_order: 2 } }
+  - { scope: { path: files.md }, values: { title: Files, nav_order: 3 } }
+  - { scope: { path: output.md }, values: { title: Output, nav_order: 4 } }
+  - { scope: { path: ripgrep.md }, values: { title: ffs and ripgrep, nav_order: 5 } }
+  - { scope: { path: examples.md }, values: { title: Examples, nav_order: 6 } }
+  - { scope: { path: man.md }, values: { title: man ffs, nav_order: 7 } }

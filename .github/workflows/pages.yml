@@ -1,0 +1,51 @@
+name: Docs site
+
+# Builds docs/ into the GitHub Pages site. Needs Pages enabled once, with
+# "GitHub Actions" as the source (Settings > Pages).
+on:
+  push:
+    branches: [main]
+    paths: ['docs/**', '.github/workflows/pages.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: The man page as a page
+        shell: bash
+        run: |
+          {
+            printf '# man ffs\n\nThe man page, as `man ffs` shows it.\n\n```text\n'
+            groff -mdoc -Tascii -P-cbou docs/ffs.1
+            printf '```\n'
+          } > docs/man.md
+          sed -i 's/(ffs\.1)/(man.md)/' docs/README.md
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/jekyll-build-pages@v1
+        with:
+          source: ./docs
+          destination: ./_site
+      - uses: actions/upload-pages-artifact@v3
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

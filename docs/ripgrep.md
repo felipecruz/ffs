@@ -42,5 +42,5 @@ Error messages still start with `ffs:`. Tools that bundle their own ripgrep,
 such as an editor's search box, aren't affected.
 
 What agents actually run, and so what ffs was built for, is in
-[SEARCH_CMDs.md](../SEARCH_CMDs.md): 3,614 shell commands from 141 agent
+[SEARCH_CMDs.md](https://github.com/felipecruz/ffs/blob/main/SEARCH_CMDs.md): 3,614 shell commands from 141 agent
 jobs, a third of them searches.

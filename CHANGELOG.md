@@ -46,6 +46,8 @@ are gone (PATTERN is a regex, and `-n` prints `path:line:content`).
   Redis 8.0.2 source and checks its output, and checks that every flag is
   in the man page and in `--help`; `--update` rewrites the outputs. CI
   fetches Redis to run it. It found `--no-hidden` missing from `--help`.
+  `.github/workflows/pages.yml` publishes `docs/` as a GitHub Pages site
+  (Just the Docs theme, with search), the man page included.
 - New `bench/agent.sh`: 15 agent-style calls on the Redis source, each
   timed against ripgrep with identical output required; the table is in
   the README. ffs is faster on 14 of them and 2.4x slower on a regex with

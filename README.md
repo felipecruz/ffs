@@ -258,8 +258,9 @@ there forever, because `libffs.a` was built without libc
 
 ## More
 
-- [docs/](docs/README.md): how to use ffs, a page per topic, with tested
-  examples, and the man page.
+- [docs/](docs/README.md), also at
+  [felipecruz.github.io/ffs](https://felipecruz.github.io/ffs/): how to use
+  ffs, a page per topic, with tested examples, and the man page.
 - [ARCHITECTURE.md](ARCHITECTURE.md): how the code works, the 16-byte loop
   and the regex engine.
 - [EXPERIMENTS.md](EXPERIMENTS.md): the full lab notebook, with 15
