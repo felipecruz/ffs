@@ -77,7 +77,8 @@ const IgnoreDir = struct {
 
 /// Walks every regular file under `root` (opened with `.iterate = true`) and
 /// calls `visitor.visitFile` for each, on `jobs` worker tasks. Returns when
-/// the whole tree has been walked.
+/// the whole tree has been walked, or the first error a worker hit (out of
+/// memory, or one from `visitFile`), once every worker has stopped.
 pub fn walk(io: Io, gpa: std.mem.Allocator, root: Io.Dir, visitor: anytype, jobs: usize, filter: Filter) !void {
     const W = Walker(@typeInfo(@TypeOf(visitor)).pointer.child);
     var w: W = .{ .io = io, .gpa = gpa, .root = root, .visitor = visitor, .filter = filter, .arena = .init(gpa) };
@@ -91,6 +92,7 @@ pub fn walk(io: Io, gpa: std.mem.Allocator, root: Io.Dir, visitor: anytype, jobs
     defer group.cancel(io);
     for (0..@max(jobs, 1)) |_| group.async(io, W.work, .{&w});
     try group.await(io);
+    if (w.err) |err| return err;
 }
 
 fn Walker(comptime Visitor: type) type {
@@ -120,6 +122,9 @@ fn Walker(comptime Visitor: type) type {
         /// a worker that just went idle may be missed, and the files are then
         /// visited by the worker that found them.
         idle: std.atomic.Value(usize) = .init(0),
+        /// The first error a worker hit; the others then stop. Guarded by
+        /// `mutex`.
+        err: ?anyerror = null,
 
         const Item = union(enum) {
             dir: Dir,
@@ -160,8 +165,8 @@ fn Walker(comptime Visitor: type) type {
         fn next(w: *Self) Io.Cancelable!?Item {
             w.mutex.lockUncancelable(w.io);
             defer w.mutex.unlock(w.io);
-            while (w.items.items.len == 0) {
-                if (w.pending == 0) return null;
+            while (w.items.items.len == 0 or w.err != null) {
+                if (w.pending == 0 or w.err != null) return null;
                 _ = w.idle.fetchAdd(1, .monotonic);
                 defer _ = w.idle.fetchSub(1, .monotonic);
                 try w.ready.wait(w.io, &w.mutex); // returns holding the mutex
@@ -176,12 +181,18 @@ fn Walker(comptime Visitor: type) type {
             if (w.pending == 0) w.ready.broadcast(w.io); // wake the idle workers to exit
         }
 
+        // Records the first error and wakes the idle workers to stop. The
+        // items left in the queue are freed by `deinit`.
+        fn fail(w: *Self, err: anyerror) void {
+            w.mutex.lockUncancelable(w.io);
+            defer w.mutex.unlock(w.io);
+            if (w.err == null) w.err = err;
+            w.ready.broadcast(w.io);
+        }
+
         // One worker: its own `Local`, then items until the queue runs dry.
         fn work(w: *Self) Io.Cancelable!void {
-            var local = w.visitor.initLocal() catch |err| {
-                std.log.err("worker: {t}", .{err});
-                return;
-            };
+            var local = w.visitor.initLocal() catch |err| return w.fail(err);
             defer w.visitor.deinitLocal(&local);
 
             while (try w.next()) |item| {
@@ -191,17 +202,9 @@ fn Walker(comptime Visitor: type) type {
                 }
                 w.process(&local, item) catch |err| switch (err) {
                     error.Canceled => return error.Canceled,
-                    else => std.log.err("{s}: {t}", .{ w.itemPath(item), err }),
+                    else => return w.fail(err),
                 };
             }
-        }
-
-        fn itemPath(_: *Self, item: Item) []const u8 {
-            const rel = switch (item) {
-                .dir => |d| d.rel,
-                .files => |f| f.rel,
-            };
-            return if (rel.len == 0) "." else rel;
         }
 
         fn process(w: *Self, local: *Visitor.Local, item: Item) !void {

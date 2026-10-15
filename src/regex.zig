@@ -17,7 +17,9 @@
 //!     (?i) (?i:e)  ignore case for the rest of the group, or inside e
 //!
 //! The VM runs in O(line length × program size) time with no backtracking,
-//! so no pattern is catastrophically slow. `Vm.isMatch` answers whether a
+//! so no pattern is catastrophically slow. Compiling is bounded too: groups
+//! and repetitions nest at most `max_depth` deep, as in ripgrep, and the
+//! program has at most `max_prog` instructions. `Vm.isMatch` answers whether a
 //! line matches; `Vm.find` also says where (leftmost-first, as in ripgrep),
 //! for `-o`. Most lines never reach the VM: every match of most regexes
 //! contains one of a few literals ("PM_" in `PM_[A-Z]+`; "cancel" or
@@ -38,11 +40,16 @@ pub const Error = error{
     BadRepeat,
     NothingToRepeat,
     TooComplex,
+    TooDeep,
     BadGroup,
 };
 
 /// Programs larger than this are rejected (e.g. `[a-z]{9999}`).
 const max_prog = 10_000;
+
+/// How deeply groups and repetitions may nest (ripgrep's limit). The parser,
+/// the compiler and the literal analysis recurse once per level.
+const max_depth = 250;
 
 const Set = std.bit_set.Integer(256);
 
@@ -101,6 +108,7 @@ pub const Regex = struct {
         var p: Parser = .{ .arena = a, .src = pattern, .fold = ignore_case };
         const root = try p.alt();
         if (p.i != pattern.len) return error.UnbalancedParen; // stray ')'
+        if (try treeDepth(a, &root) > max_depth) return error.TooDeep;
 
         var c: Compiler = .{ .arena = a };
         try c.node(root);
@@ -136,8 +144,8 @@ pub fn findLines(re: *const Regex, vm: *Vm, data: []const u8, first_line: usize,
     if (re.exact) return prefilter(re, data, first_line, sink);
     const filter: Filter(@TypeOf(sink)) = .{ .re = re, .vm = vm, .sink = sink };
     if (re.literals.len == 0) {
-        if (pcre.enabled) if (re.pcre) |p| return pcreLines(p, vm.pcre.?, data, first_line, sink);
-        return everyLine(data, first_line, filter);
+        if (pcre.enabled) if (re.pcre != null) return pcreLines(re, vm, data, first_line, filter);
+        return everyLine(data, 0, first_line, filter);
     }
     return prefilter(re, data, first_line, filter);
 }
@@ -170,19 +178,25 @@ fn Filter(comptime Sink: type) type {
 // run across a newline (`\s` and `[^a]` match '\n'), so one that does is
 // checked again on its first line alone. That can't skip a real match: any
 // match within a line is also a match in the buffer, so the scan stops at or
-// before it.
-fn pcreLines(p: pcre.Pattern, m: pcre.Matcher, data: []const u8, first_line: usize, sink: anytype) !usize {
+// before it. If PCRE2 gives up (a match or JIT stack limit), the rest of the
+// buffer goes line by line, where the Pike VM takes over from it.
+fn pcreLines(re: *const Regex, vm: *Vm, data: []const u8, first_line: usize, filter: anytype) !usize {
+    const p = re.pcre.?;
+    const m = vm.pcre.?;
+    const sink = filter.sink;
     var line = first_line;
     var counted: usize = 0; // newlines before this offset are in `line`
     var pos: usize = 0; // a line start
     while (pos < data.len) {
-        const span = m.find(p, data, pos) orelse break;
+        const found = m.find(p, data, pos) catch
+            return everyLine(data, pos, line + std.mem.countScalar(u8, data[counted..pos], '\n'), filter);
+        const span = found orelse break;
         if (span.start >= data.len) break; // an empty match after the last '\n'
         const start = if (std.mem.findScalarLast(u8, data[pos..span.start], '\n')) |nl| pos + nl + 1 else pos;
         const end = std.mem.indexOfScalarPos(u8, data, span.start, '\n') orelse data.len;
         line += std.mem.countScalar(u8, data[counted..start], '\n');
         counted = start;
-        if (span.end <= end or m.find(p, data[start..end], 0) != null) {
+        if (span.end <= end or vm.isMatch(re, data[start..end])) {
             try sink.onLine(match.Match{ .line = line, .data = data, .pos = span.start, .end = end });
         }
         pos = end + 1;
@@ -190,10 +204,10 @@ fn pcreLines(p: pcre.Pattern, m: pcre.Matcher, data: []const u8, first_line: usi
     return line + std.mem.countScalar(u8, data[counted..], '\n');
 }
 
-// No required literal: every line is a candidate.
-fn everyLine(data: []const u8, first_line: usize, sink: anytype) !usize {
+// No required literal: every line from `from` (a line start) on is a candidate.
+fn everyLine(data: []const u8, from: usize, first_line: usize, sink: anytype) !usize {
     var line = first_line;
-    var start: usize = 0;
+    var start = from;
     while (start < data.len) {
         const end = std.mem.indexOfScalarPos(u8, data, start, '\n') orelse data.len;
         try sink.onLine(match.Match{ .line = line, .data = data, .pos = start, .end = end });
@@ -211,6 +225,7 @@ const Parser = struct {
     src: []const u8,
     i: usize = 0,
     fold: bool, // ignore case: letters match both cases
+    groups: usize = 0, // groups open around `i`
 
     fn peek(p: *const Parser) ?u8 {
         return if (p.i < p.src.len) p.src[p.i] else null;
@@ -285,6 +300,11 @@ const Parser = struct {
         p.i += 1;
         switch (c) {
             '(' => {
+                // Checked here as well as in `treeDepth`: this recursion
+                // happens before there is a tree to measure.
+                p.groups += 1;
+                defer p.groups -= 1;
+                if (p.groups > max_depth) return error.TooDeep;
                 const outer_fold = p.fold;
                 if (p.peek() == '?') {
                     p.i += 1;
@@ -457,6 +477,24 @@ fn isWord(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_';
 }
 
+// How deeply concatenations, alternations and repetitions nest, without
+// recursing: `x++++…` is a chain of repetitions as long as the pattern.
+fn treeDepth(a: Allocator, root: *const Node) Error!usize {
+    const Item = struct { node: *const Node, depth: usize };
+    var stack: std.ArrayList(Item) = .empty;
+    try stack.append(a, .{ .node = root, .depth = 1 });
+    var deepest: usize = 0;
+    while (stack.pop()) |it| {
+        deepest = @max(deepest, it.depth);
+        switch (it.node.*) {
+            .concat, .alt => |items| for (items) |*item| try stack.append(a, .{ .node = item, .depth = it.depth + 1 }),
+            .repeat => |r| try stack.append(a, .{ .node = r.node, .depth = it.depth + 1 }),
+            .set, .bol, .eol, .word_boundary => {},
+        }
+    }
+    return deepest;
+}
+
 // ---------------------------------------------------------------- required literal
 
 // Literals every match contains one of, for the SIMD prefilter; null if
@@ -607,7 +645,14 @@ const Compiler = struct {
                 for (jumps.items) |j| c.prog.items[j] = .{ .jmp = c.here() };
             },
             .repeat => |r| {
-                for (0..r.min) |_| try c.node(r.node.*);
+                for (0..r.min) |k| {
+                    const before = c.here();
+                    try c.node(r.node.*);
+                    // A body that compiles to nothing matches only the empty
+                    // string, however often it is repeated: `(){4294967295}`
+                    // must not loop four billion times.
+                    if (k == 0 and c.here() == before) return;
+                }
                 if (r.max) |max| {
                     // Each optional copy: split body end. Skipping one skips the rest.
                     var splits: std.ArrayList(u32) = .empty;
@@ -679,7 +724,10 @@ pub const Vm = struct {
     /// at a time, starting a new thread at every position (skipping ahead
     /// with `first` while none is alive).
     pub fn isMatch(vm: *Vm, re: *const Regex, line: []const u8) bool {
-        if (pcre.enabled) if (re.pcre) |p| return vm.pcre.?.find(p, line, 0) != null;
+        if (pcre.enabled) if (re.pcre) |p| {
+            // On an error (a PCRE2 limit) the VM answers instead.
+            if (vm.pcre.?.find(p, line, 0)) |m| return m != null else |_| {}
+        };
         var n_cur: usize = 0;
         vm.gen += 1;
         var i: usize = 0;
@@ -709,8 +757,10 @@ pub const Vm = struct {
     /// make the match longer.
     pub fn find(vm: *Vm, re: *const Regex, line: []const u8, from: usize) ?Span {
         if (pcre.enabled) if (re.pcre) |p| {
-            const m = vm.pcre.?.find(p, line, from) orelse return null;
-            return .{ .start = m.start, .end = m.end };
+            if (vm.pcre.?.find(p, line, from)) |found| {
+                const m = found orelse return null;
+                return .{ .start = m.start, .end = m.end };
+            } else |_| {}
         };
         var found: ?Span = null;
         var n_cur: usize = 0;
@@ -1024,6 +1074,29 @@ test "regex errors" {
         .{ "[a-z]{20000}", error.TooComplex },
     };
     for (cases) |c| try testing.expectError(c[1], Regex.compile(testing.allocator, c[0], false));
+
+    // Too deep to compile without risking the stack.
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const nested = struct {
+        fn f(al: Allocator, depth: usize) ![]const u8 {
+            return std.mem.concat(al, u8, &.{ try repeat(al, "(", depth), "x", try repeat(al, ")", depth) });
+        }
+    }.f;
+    try testing.expectError(error.TooDeep, Regex.compile(testing.allocator, try nested(a, 251), false));
+    // Stopped before the parser's own recursion goes deep.
+    try testing.expectError(error.TooDeep, Regex.compile(testing.allocator, try repeat(a, "(", 100_000), false));
+    try testing.expectError(error.TooDeep, Regex.compile(testing.allocator, try std.mem.concat(a, u8, &.{ "x", try repeat(a, "+", 300) }), false));
+
+    // Just inside the limit, and repeats of an empty body, compile (quickly).
+    for ([_][]const u8{ try nested(a, 200), "(){4294967295}x", "((){4294967295}){4294967295}x", "(?:(?i)){99999}x" }) |ok| {
+        var re = try Regex.compile(testing.allocator, ok, false);
+        defer re.deinit();
+        var vm = try Vm.init(testing.allocator, &re);
+        defer vm.deinit(testing.allocator);
+        try testing.expect(vm.isMatch(&re, "x"));
+    }
 }
 
 test "regex required literal" {
@@ -1062,6 +1135,12 @@ test "regex required literal" {
         defer re.deinit();
         try testing.expectEqual(c[1], re.exact);
     }
+}
+
+fn repeat(a: Allocator, s: []const u8, n: usize) ![]const u8 {
+    const out = try a.alloc(u8, s.len * n);
+    for (0..n) |k| @memcpy(out[k * s.len ..][0..s.len], s);
+    return out;
 }
 
 // Reference matcher for the randomized test: backtracking straight over
@@ -1241,7 +1320,7 @@ test "regex findLines: prefiltered and every-line paths agree" {
         all.clearRetainingCapacity();
         const after = try findLines(&re, &vm, data, 1, CollectLines{ .gpa = gpa, .lines = &got });
         const filter: Filter(CollectLines) = .{ .re = &re, .vm = &vm, .sink = .{ .gpa = gpa, .lines = &all } };
-        const after_all = try everyLine(data, 1, filter);
+        const after_all = try everyLine(data, 0, 1, filter);
         try testing.expectEqualSlices(usize, c[2], got.items);
         try testing.expectEqualSlices(usize, c[2], all.items);
         try testing.expectEqual(6, after);

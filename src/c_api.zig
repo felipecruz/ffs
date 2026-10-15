@@ -54,7 +54,11 @@ pub export fn ffs_search(
         .jobs = if (threads == 0) search.autoJobs() else threads,
         .ignore_case = ignore_case,
         .regex = if (re) |*r| r else null,
-    }, .{ .callback = .{ .ctx = &state, .f = State.onHit } }) catch return FFS_EROOT; // the only error left: opening root
+    }, .{ .callback = .{ .ctx = &state, .f = State.onHit } }) catch |err| return switch (err) {
+        // Collecting a line's text fails as a write when memory runs out.
+        error.OutOfMemory, error.WriteFailed => FFS_ENOMEM,
+        else => FFS_EROOT, // the only other error: opening root
+    };
     if (state.out_of_memory) return FFS_ENOMEM;
     return if (state.stopped) FFS_STOPPED else FFS_OK;
 }

@@ -28,6 +28,7 @@ extern fn pcre2_get_ovector_pointer_8(md: *MatchData) [*]usize;
 const CASELESS: u32 = 0x00000008;
 const MULTILINE: u32 = 0x00000400;
 const JIT_COMPLETE: u32 = 0x00000001;
+const ERROR_NOMATCH: c_int = -1;
 
 pub const Span = struct { start: usize, end: usize };
 
@@ -67,11 +68,15 @@ pub const Matcher = struct {
         pcre2_match_data_free_8(m.md);
     }
 
-    /// The leftmost-first match in `subject` at or after `from`.
-    pub fn find(m: Matcher, p: Pattern, subject: []const u8, from: usize) ?Span {
+    /// The leftmost-first match in `subject` at or after `from`, or
+    /// `error.Limit` if PCRE2 gave up before knowing (its match limit, or
+    /// the JIT stack on a long subject): that is not "no match".
+    pub fn find(m: Matcher, p: Pattern, subject: []const u8, from: usize) error{Limit}!?Span {
         // A zero-length subject still needs a valid pointer.
         const ptr: [*]const u8 = if (subject.len > 0) subject.ptr else "";
-        if (pcre2_jit_match_8(p.code, ptr, subject.len, from, 0, m.md, null) < 0) return null;
+        const rc = pcre2_jit_match_8(p.code, ptr, subject.len, from, 0, m.md, null);
+        if (rc == ERROR_NOMATCH) return null;
+        if (rc < 0) return error.Limit;
         const ov = pcre2_get_ovector_pointer_8(m.md);
         return .{ .start = ov[0], .end = ov[1] };
     }

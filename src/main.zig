@@ -198,7 +198,13 @@ const Cli = struct {
                 c.print.after = try number(v);
                 c.print.before = c.print.after;
             },
-            .glob => try c.globs.add(a, v, .include),
+            .glob => c.globs.add(a, v, .include) catch |err| switch (err) {
+                error.TooComplex => {
+                    std.debug.print("ffs: glob too complex: {s}\n", .{v});
+                    std.process.exit(2);
+                },
+                error.OutOfMemory => |e| return e,
+            },
             .hidden => c.hidden = true,
             .no_hidden => c.hidden = false,
             .no_ignore => c.ignore = false,

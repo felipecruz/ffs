@@ -11,13 +11,29 @@
 //! at any depth; with a '/', it matches the whole path, relative to the
 //! directory of the ignore file (or the search root, for `-g`). A trailing
 //! '/' matches directories only.
+//!
+//! Ignore files come with the tree being searched, so a hostile one must not
+//! make the search hang or run out of memory: `**` is matched in time linear
+//! in the pattern times the path, and `{a,b}` expansion has a budget. A rule
+//! that would need more is left out (`error.TooComplex`).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+/// The longest pattern with `**` or `{` that is accepted: matching `**`
+/// keeps a state per pattern byte, and finding braces a stack. Paths are
+/// shorter than this anyway.
+pub const max_len = 4096;
+
+pub const Error = Allocator.Error || error{TooComplex};
+
 /// Does `text` match `pattern`? `*`, `?` and classes never match '/'.
-/// With `fold`, ASCII letters match either case.
+/// With `fold`, ASCII letters match either case. A pattern with `**` must
+/// be at most `max_len` bytes; a longer one matches nothing.
 pub fn match(pattern: []const u8, text: []const u8, fold: bool) bool {
+    if (std.mem.indexOf(u8, pattern, "**") != null) return matchStates(pattern, text, fold);
+    // Only single `*`s: backtracking to the last one is enough, since a
+    // later `*` can take whatever an earlier one would have.
     var p: usize = 0;
     var t: usize = 0;
     // Backtracking point for the last single `*`: where it started in the
@@ -27,9 +43,6 @@ pub fn match(pattern: []const u8, text: []const u8, fold: bool) bool {
     while (true) {
         if (p < pattern.len) {
             const c = pattern[p];
-            if (c == '*' and p + 1 < pattern.len and pattern[p + 1] == '*') {
-                return doubleStar(pattern, p, text, t, fold);
-            }
             if (c == '*') {
                 star_p = p;
                 star_t = t;
@@ -52,27 +65,94 @@ pub fn match(pattern: []const u8, text: []const u8, fold: bool) bool {
     }
 }
 
-// `**` at pattern[p]: `**/` matches zero or more whole directories, a final
-// `/**` everything below, and any other `**` any run of bytes.
-fn doubleStar(pattern: []const u8, p: usize, text: []const u8, t: usize, fold: bool) bool {
+// A pattern with `**`, run as an automaton whose states are positions in
+// the pattern: every position the text read so far can have reached is
+// tracked at once, so no choice is ever retried. Backtracking over several
+// `**` instead takes time exponential in their number.
+//
+// `**/` matches zero or more whole directories (`(.*/)?`), and any other
+// `**` any run of bytes, '/' included; a final `/**` is everything below.
+fn matchStates(pattern: []const u8, text: []const u8, fold: bool) bool {
+    if (pattern.len > max_len) return false;
+    var states: [2][max_len + 1]u8 = undefined;
+    var cur = states[0][0 .. pattern.len + 1];
+    var next = states[1][0 .. pattern.len + 1];
+    @memset(cur, 0);
+    cur[0] = at;
+    skipEmpty(pattern, cur);
+    for (text) |c| {
+        @memset(next, 0);
+        var alive = false;
+        for (cur[0..pattern.len], 0..) |flags, p| {
+            if (flags == 0) continue;
+            alive = true;
+            if (flags & in_dirs != 0) {
+                // Inside `**/`'s directories: any byte, and after a '/'
+                // possibly the end of them.
+                next[p] |= in_dirs;
+                if (c == '/') next[token(pattern, p).double_star.to] |= at;
+            }
+            if (flags & at == 0) continue;
+            switch (token(pattern, p)) {
+                .double_star => |exit| if (!exit.slash) {
+                    next[p] |= at;
+                },
+                .star => if (c != '/') {
+                    next[p] |= at;
+                },
+                .one => {
+                    var q = p;
+                    if (matchOne(pattern, &q, c, fold)) next[q] |= at;
+                },
+            }
+        }
+        if (!alive) return false;
+        skipEmpty(pattern, next);
+        std.mem.swap([]u8, &cur, &next);
+    }
+    return cur[pattern.len] & at != 0;
+}
+
+// State flags of a pattern position: `at` it, or (for `**/` only) inside
+// the directories it matches. The two differ in what follows: from `at`,
+// `**/` can match no directory at all, but once a byte is read it must end
+// with a '/'.
+const at = 1;
+const in_dirs = 2;
+
+// Adds the states reachable without reading a byte: past a `*` or `**`
+// that matches nothing, and into `**/`'s directories. They are all at or
+// after the position they come from, so one pass does it.
+fn skipEmpty(pattern: []const u8, set: []u8) void {
+    for (0..pattern.len) |p| {
+        if (set[p] & at == 0) continue;
+        switch (token(pattern, p)) {
+            .double_star => |exit| {
+                set[exit.to] |= at;
+                if (exit.slash) set[p] |= in_dirs;
+            },
+            .star => set[p + 1] |= at,
+            .one => {},
+        }
+    }
+}
+
+const Token = union(enum) {
+    /// `**`, and where it ends: the position after it, or after the '/' of
+    /// `**/` (`slash`).
+    double_star: struct { to: usize, slash: bool },
+    star,
+    /// A byte, a class or an escape: see `matchOne`.
+    one,
+};
+
+fn token(pattern: []const u8, p: usize) Token {
+    if (pattern[p] != '*') return .one;
+    if (p + 1 == pattern.len or pattern[p + 1] != '*') return .star;
     var rest = p + 2;
     while (rest < pattern.len and pattern[rest] == '*') rest += 1;
-    if (rest < pattern.len and pattern[rest] == '/') {
-        // `**/rest`: rest at t, or after any later '/'.
-        const tail = pattern[rest + 1 ..];
-        if (match(tail, text[t..], fold)) return true;
-        var i = t;
-        while (std.mem.indexOfScalarPos(u8, text, i, '/')) |slash| : (i = slash + 1) {
-            if (match(tail, text[slash + 1 ..], fold)) return true;
-        }
-        return false;
-    }
-    const tail = pattern[rest..];
-    var i = t;
-    while (i <= text.len) : (i += 1) {
-        if (match(tail, text[i..], fold)) return true;
-    }
-    return false;
+    if (rest < pattern.len and pattern[rest] == '/') return .{ .double_star = .{ .to = rest + 1, .slash = true } };
+    return .{ .double_star = .{ .to = rest, .slash = false } };
 }
 
 // One byte of the pattern (or one class) at pattern[p.*] against `c`.
@@ -137,55 +217,76 @@ fn inRangeFolded(lo: u8, hi: u8, c: u8) bool {
     return (l >= lo and l <= hi) or (u >= lo and u <= hi);
 }
 
+/// What brace expansion may still produce. `{a,b}` repeated n times is 2^n
+/// patterns, so without a limit one line of an ignore file could take all
+/// the memory there is.
+const Budget = struct {
+    /// Expansion steps; each finished pattern takes one.
+    steps: usize,
+    /// Bytes of expanded patterns.
+    bytes: usize,
+
+    fn forGlob() Budget {
+        return .{ .steps = 1024, .bytes = 1 << 20 };
+    }
+};
+
 /// Expands `{a,b}` alternatives (nested too) into separate patterns,
 /// allocated in `a`.
-fn expandBraces(a: Allocator, pattern: []const u8, out: *std.ArrayList([]const u8)) Allocator.Error!void {
-    // The first top-level '{' with a matching '}'.
+fn expandBraces(a: Allocator, pattern: []const u8, out: *std.ArrayList([]const u8), budget: *Budget) Error!void {
+    if (budget.steps == 0) return error.TooComplex;
+    budget.steps -= 1;
+    if (std.mem.indexOfScalar(u8, pattern, '{') == null) return out.append(a, pattern);
+    if (pattern.len > max_len) return error.TooComplex;
+    const group = firstGroup(pattern) orelse return out.append(a, pattern);
+    const i = group.open;
+    const end = group.close;
+    var start = i + 1;
+    var depth: usize = 0;
+    var j = start;
+    while (j <= end) : (j += 1) {
+        const c = if (j == end) ',' else pattern[j];
+        switch (c) {
+            '\\' => j += 1,
+            '{' => depth += 1,
+            '}' => depth -= 1,
+            ',' => if (depth == 0) {
+                const len = i + (j - start) + (pattern.len - end - 1);
+                if (len > budget.bytes) return error.TooComplex;
+                budget.bytes -= len;
+                const joined = try std.mem.concat(a, u8, &.{ pattern[0..i], pattern[start..j], pattern[end + 1 ..] });
+                try expandBraces(a, joined, out, budget);
+                start = j + 1;
+            },
+            else => {},
+        }
+    }
+}
+
+// The first '{' that has a matching '}', and that '}', in one pass:
+// checking each '{' with a scan of its own is quadratic on `{{{{…`.
+const Group = struct { open: usize, close: usize };
+
+fn firstGroup(pattern: []const u8) ?Group {
+    var open: [max_len]u16 = undefined; // unmatched '{' positions
+    var n: usize = 0;
+    var best: ?Group = null;
     var i: usize = 0;
     while (i < pattern.len) : (i += 1) {
         switch (pattern[i]) {
             '\\' => i += 1,
-            '{' => if (braceEnd(pattern, i)) |end| {
-                var start = i + 1;
-                var depth: usize = 0;
-                var j = start;
-                while (j <= end) : (j += 1) {
-                    const c = if (j == end) ',' else pattern[j];
-                    switch (c) {
-                        '\\' => j += 1,
-                        '{' => depth += 1,
-                        '}' => depth -= 1,
-                        ',' => if (depth == 0) {
-                            const joined = try std.mem.concat(a, u8, &.{ pattern[0..i], pattern[start..j], pattern[end + 1 ..] });
-                            try expandBraces(a, joined, out);
-                            start = j + 1;
-                        },
-                        else => {},
-                    }
-                }
-                return;
+            '{' => {
+                open[n] = @intCast(i);
+                n += 1;
+            },
+            '}' => if (n > 0) {
+                n -= 1;
+                if (best == null or open[n] < best.?.open) best = .{ .open = open[n], .close = i };
             },
             else => {},
         }
     }
-    try out.append(a, pattern);
-}
-
-fn braceEnd(pattern: []const u8, start: usize) ?usize {
-    var depth: usize = 0;
-    var i = start;
-    while (i < pattern.len) : (i += 1) {
-        switch (pattern[i]) {
-            '\\' => i += 1,
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if (depth == 0) return i;
-            },
-            else => {},
-        }
-    }
-    return null;
+    return best;
 }
 
 pub const Rule = struct {
@@ -221,9 +322,15 @@ pub const RuleSet = struct {
     /// Some rule includes paths (a `-g` without '!', or a '!' line).
     any_include: bool = false,
 
-    /// Adds one gitignore-style pattern. `negated` (a leading '!', already
-    /// stripped) means the opposite of `kind`. Patterns are copied into `a`.
-    pub fn add(set: *RuleSet, a: Allocator, line: []const u8, kind_plain: Decision) Allocator.Error!void {
+    /// Adds one gitignore-style pattern. A leading '!' means the opposite of
+    /// `kind`. Patterns are copied into `a`. `error.TooComplex`: the pattern
+    /// was left out, see the top of this file.
+    pub fn add(set: *RuleSet, a: Allocator, line: []const u8, kind_plain: Decision) Error!void {
+        var budget: Budget = .forGlob();
+        return set.addBudgeted(a, line, kind_plain, &budget);
+    }
+
+    fn addBudgeted(set: *RuleSet, a: Allocator, line: []const u8, kind_plain: Decision, budget: *Budget) Error!void {
         var pat = line;
         var kind = kind_plain;
         if (pat.len > 0 and pat[0] == '!') {
@@ -241,7 +348,10 @@ pub const RuleSet = struct {
         const basename = std.mem.indexOfScalar(u8, pat, '/') == null;
         if (pat[0] == '/') pat = pat[1..];
         var expanded: std.ArrayList([]const u8) = .empty;
-        try expandBraces(a, pat, &expanded);
+        try expandBraces(a, pat, &expanded, budget);
+        for (expanded.items) |p| {
+            if (p.len > max_len and std.mem.indexOf(u8, p, "**") != null) return error.TooComplex;
+        }
         for (expanded.items) |p| {
             const shape = shapeOf(p, basename);
             const lit = switch (shape) {
@@ -255,14 +365,22 @@ pub const RuleSet = struct {
     }
 
     /// Adds every line of an ignore file: comments and blank lines skipped,
-    /// trailing spaces trimmed.
+    /// trailing spaces trimmed. Lines too complex to use are skipped too.
+    /// Each line gets the steps of one glob, but the bytes are budgeted for
+    /// the whole file, in proportion to its size: a file of many lines that
+    /// each expand a little must not add up to gigabytes.
     pub fn addIgnoreFile(set: *RuleSet, a: Allocator, contents: []const u8) Allocator.Error!void {
+        var budget: Budget = .{ .steps = 0, .bytes = 2 * contents.len + (1 << 20) };
         var it = std.mem.splitScalar(u8, contents, '\n');
         while (it.next()) |raw| {
             var line = std.mem.trimEnd(u8, raw, "\r");
             if (line.len == 0 or line[0] == '#') continue;
             while (line.len > 0 and line[line.len - 1] == ' ' and !(line.len > 1 and line[line.len - 2] == '\\')) line = line[0 .. line.len - 1];
-            try set.add(a, line, .ignore);
+            budget.steps = Budget.forGlob().steps;
+            set.addBudgeted(a, line, .ignore, &budget) catch |err| switch (err) {
+                error.TooComplex => continue,
+                error.OutOfMemory => |e| return e,
+            };
         }
     }
 
@@ -316,6 +434,14 @@ test "glob match" {
         .{ "abc", "abcd", false },
         .{ "*a*b", "xaxxb", true },
         .{ "[abc", "[abc", true }, // unclosed class: literal
+        .{ "*a**/z", "aaz", true }, // the `*` must take "a" for `**/` to match nothing
+        .{ "a/***/b", "a/x/b", true },
+        .{ "**", "a/b", true },
+        .{ "a**", "ab/c", true },
+        .{ "**/\\*", "a/*", true },
+        .{ "**/\\*", "a/b", false },
+        .{ "a/**/[bc]?", "a/x/cd", true },
+        .{ "a/**/[bc]?", "a/x/c/", false },
     };
     for (cases) |c| {
         if (match(c[0], c[1], false) != c[2]) {
@@ -326,6 +452,87 @@ test "glob match" {
     try testing.expect(match("*.SWIFT", "a.swift", true));
     try testing.expect(match("[A-C]x", "bx", true));
     try testing.expect(!match("*.SWIFT", "a.swift", false));
+}
+
+// Reference for the randomized test: the glob rules, by plain recursion
+// (exponential, fine on short inputs).
+fn matchRef(pattern: []const u8, text: []const u8) bool {
+    if (pattern.len == 0) return text.len == 0;
+    switch (token(pattern, 0)) {
+        .double_star => |exit| {
+            const rest = pattern[exit.to..];
+            if (exit.slash) {
+                if (matchRef(rest, text)) return true;
+                for (text, 0..) |c, k| if (c == '/' and matchRef(rest, text[k + 1 ..])) return true;
+                return false;
+            }
+            for (0..text.len + 1) |k| if (matchRef(rest, text[k..])) return true;
+            return false;
+        },
+        .star => {
+            for (0..text.len + 1) |k| {
+                if (k > 0 and text[k - 1] == '/') break;
+                if (matchRef(pattern[1..], text[k..])) return true;
+            }
+            return false;
+        },
+        .one => {
+            var q: usize = 0;
+            return text.len > 0 and matchOne(pattern, &q, text[0], false) and matchRef(pattern[q..], text[1..]);
+        },
+    }
+}
+
+test "glob match agrees with a recursive reference" {
+    var prng: std.Random.DefaultPrng = .init(0x610b);
+    const rand = prng.random();
+    const pieces = [_][]const u8{ "a", "b", "/", "*", "**", "**/", "/**", "?", "[ab]", "[!a]", "\\*", "ab" };
+    var pat_buf: [64]u8 = undefined;
+    var text_buf: [12]u8 = undefined;
+    for (0..20_000) |_| {
+        var n: usize = 0;
+        for (0..1 + rand.uintLessThan(usize, 6)) |_| {
+            const piece = pieces[rand.uintLessThan(usize, pieces.len)];
+            @memcpy(pat_buf[n..][0..piece.len], piece);
+            n += piece.len;
+        }
+        const pattern = pat_buf[0..n];
+        const text = text_buf[0..rand.uintAtMost(usize, text_buf.len)];
+        for (text) |*c| c.* = "ab/*"[rand.uintLessThan(usize, 4)];
+        if (match(pattern, text, false) != matchRef(pattern, text)) {
+            std.debug.print("glob {s} on {s}: expected {}\n", .{ pattern, text, matchRef(pattern, text) });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "hostile patterns stay fast and small" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const rep = struct {
+        fn f(al: Allocator, s: []const u8, n: usize) ![]const u8 {
+            const out = try al.alloc(u8, s.len * n);
+            for (0..n) |k| @memcpy(out[k * s.len ..][0..s.len], s);
+            return out;
+        }
+    }.f;
+
+    // Backtracking over seven `**` against a 200-byte name took minutes.
+    const name = try rep(a, "a", 200);
+    try testing.expect(!match("**a**a**a**a**a**a**a**b", name, false));
+    try testing.expect(match("**a**a**a**a**a**a**a**a", name, false));
+
+    var set: RuleSet = .{};
+    // 2^26 patterns, or a line of unmatched braces: left out, quickly.
+    const bomb = try rep(a, "{a,b}", 26);
+    const braces = try rep(a, "{", 4000);
+    try testing.expectError(error.TooComplex, set.add(a, bomb, .include));
+    try testing.expectError(error.TooComplex, set.add(a, try std.mem.concat(a, u8, &.{ try rep(a, "{", 5000), "}" }), .include));
+    try set.addIgnoreFile(a, try std.mem.concat(a, u8, &.{ bomb, "\n", braces, "x\n*.{c,h}\n" }));
+    try testing.expectEqual(.ignore, set.decide("x.h", false));
+    try testing.expectEqual(.ignore, set.decide(try std.mem.concat(a, u8, &.{ braces, "x" }), false));
+    try testing.expectEqual(.none, set.decide("ab", false));
 }
 
 test "rule set: gitignore semantics" {
