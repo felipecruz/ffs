@@ -17,7 +17,7 @@ zig build
 echo "== ffs thread sweep, linux literal"
 "$H" -N --warmup 3 --min-runs 10 \
   --export-json "$OUT/h2h-ffs-threads-linux.json" \
-  -L j "$JS" "$FFS -j {j} fixtures/linux PM_RESUME"
+  -L j "$JS" "$FFS -uu -n -F -j {j} PM_RESUME fixtures/linux"
 
 echo "== rg thread sweep, same counts, same query"
 "$H" -N --warmup 3 --min-runs 10 \
@@ -27,7 +27,7 @@ echo "== rg thread sweep, same counts, same query"
 echo "== ffs thread sweep, redis literal"
 "$H" -N --warmup 5 --min-runs 30 \
   --export-json "$OUT/h2h-ffs-threads-redis.json" \
-  -L j "$JS" "$FFS -j {j} fixtures/redis dictFind"
+  -L j "$JS" "$FFS -uu -n -F -j {j} dictFind fixtures/redis"
 
 # Full width: both tools with every thread they want, plus `-j4` for each to
 # show what the old default was costing.
@@ -37,8 +37,8 @@ for spec in 'rare|PM_RESUME' 'common|ERR_PTR' 'none|zqxjvkwqz' 'long|#include <l
   echo "== $slug"
   "$H" -N -i --warmup 3 --min-runs 10 \
     --export-markdown "$OUT/h2h-linux-$slug.md" --export-json "$OUT/h2h-linux-$slug.json" \
-    -n 'ffs'        "$FFS fixtures/linux '$term'" \
-    -n 'ffs -j4'    "$FFS -j4 fixtures/linux '$term'" \
+    -n 'ffs'        "$FFS -uu -n -F -- '$term' fixtures/linux" \
+    -n 'ffs -j4'    "$FFS -uu -n -F -j4 -- '$term' fixtures/linux" \
     -n 'rg -uu'     "$RG -uu -n -F -- '$term' fixtures/linux" \
     -n 'rg -uu -j4' "$RG -uu -n -F -j4 -- '$term' fixtures/linux" </dev/null
 done
@@ -49,8 +49,8 @@ for spec in 'prefix|PM_[A-Z_]+' 'hex16|[0-9a-f]{16}' 'define|^\s*#\s*define\s+[A
   echo "== regex $slug"
   "$H" -N -i --warmup 2 --min-runs 10 \
     --export-markdown "$OUT/h2h-regex-$slug.md" --export-json "$OUT/h2h-regex-$slug.json" \
-    -n 'ffs -E'     "$FFS -E fixtures/linux '$pat'" \
-    -n 'ffs -E -j4' "$FFS -E -j4 fixtures/linux '$pat'" \
+    -n 'ffs -uu'     "$FFS -uu -n -e '$pat' fixtures/linux" \
+    -n 'ffs -uu -j4' "$FFS -uu -n -j4 -e '$pat' fixtures/linux" \
     -n 'rg -uu'     "$RG -uu -n -e '$pat' fixtures/linux" \
     -n 'rg -uu -P'  "$RG -uu -n -P -e '$pat' fixtures/linux" </dev/null
 done
@@ -58,24 +58,24 @@ done
 echo "== case-insensitive, linux"
 "$H" -N -i --warmup 2 --min-runs 10 \
   --export-markdown "$OUT/h2h-linux-icase.md" --export-json "$OUT/h2h-linux-icase.json" \
-  -n 'ffs -i'    "$FFS -i fixtures/linux PM_RESUME" \
+  -n 'ffs -i'    "$FFS -uu -n -i -F PM_RESUME fixtures/linux" \
   -n 'rg -uu -i' "$RG -uu -n -i -F PM_RESUME fixtures/linux" </dev/null
 
 echo "== redis fixture, full width"
 "$H" -N -i --warmup 5 --min-runs 30 \
   --export-markdown "$OUT/h2h-redis.md" --export-json "$OUT/h2h-redis.json" \
-  -n 'ffs'     "$FFS fixtures/redis dictFind" \
-  -n 'ffs -j8' "$FFS -j8 fixtures/redis dictFind" \
+  -n 'ffs'     "$FFS -uu -n -F dictFind fixtures/redis" \
+  -n 'ffs -j8' "$FFS -uu -n -F -j8 dictFind fixtures/redis" \
   -n 'rg -uu'  "$RG -uu -n -F dictFind fixtures/redis" </dev/null
 
 # A speed number means nothing if the two tools disagree on what they found.
 echo "== correctness: ffs and rg must agree on match counts"
 { for q in PM_RESUME ERR_PTR zqxjvkwqz; do
-    a=$("$FFS" fixtures/linux "$q" | wc -l); b=$("$RG" -uu -n -F -- "$q" fixtures/linux | wc -l)
+    a=$("$FFS" -uu -n -F -- "$q" fixtures/linux | wc -l); b=$("$RG" -uu -n -F -- "$q" fixtures/linux | wc -l)
     echo "literal $q: ffs=$a rg=$b $([ "$a" = "$b" ] && echo MATCH || echo DIFFER)"
   done
   for p in 'PM_[A-Z_]+' '[0-9a-f]{16}' '\w+_lock_irqsave\('; do
-    a=$("$FFS" -E fixtures/linux "$p" | wc -l); b=$("$RG" -uu -n -e "$p" fixtures/linux | wc -l)
+    a=$("$FFS" -uu -n -e "$p" fixtures/linux | wc -l); b=$("$RG" -uu -n -e "$p" fixtures/linux | wc -l)
     echo "regex $p: ffs=$a rg=$b $([ "$a" = "$b" ] && echo MATCH || echo DIFFER)"
   done
 } | tee "$OUT/h2h-correctness.txt"
