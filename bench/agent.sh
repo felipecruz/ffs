@@ -30,6 +30,16 @@ TABLE="$OUT/agent.md"
   echo "|---:|:---|:---|---:|---:|:---|"
 } > "$TABLE"
 
+# The mean wall time of each command in a hyperfine JSON file, one per line.
+# Schema 1 (hyperfine 1.x) has one "mean" per result; schema 2 (2.x) has a
+# "mean" for every metric, so take the one under "time_wall_clock".
+wall_means() {
+  awk '/"schema_version"/ { v2 = 1 }
+    v2 && /"time_wall_clock"/ { w = 1; next }
+    w && /}/ { w = 0 }
+    /"mean"/ && (!v2 || w) { gsub(/[^0-9.e-]/, "", $2); print $2; w = 0 }' "$1"
+}
+
 n=0
 # call "description" ARGS...   (standard input: the test log when ARGS has no path)
 call() {
@@ -47,7 +57,7 @@ call() {
     --export-json "$OUT/agent-$n.json" \
     -n ffs "$FFS $cmd" -n rg "$RG $cmd" >/dev/null
   local means f r
-  means=$(sed -n 's/.*"mean": *\([0-9.e-]*\).*/\1/p' "$OUT/agent-$n.json")
+  means=$(wall_means "$OUT/agent-$n.json")
   f=$(echo "$means" | sed -n 1p)
   r=$(echo "$means" | sed -n 2p)
   CMD=$cmd awk -v n="$n" -v what="$what" -v f="$f" -v r="$r" 'BEGIN {
@@ -78,7 +88,7 @@ call "Regex with no literal" "-n '[0-9a-f]{16}' src"
 call "Alternation with a common word" "-n 'dictFind|struct [a-z]+ \{' src"
 
 # The session as a whole: the sum of the means.
-for k in $(seq 1 "$n"); do sed -n 's/.*"mean": *\([0-9.e-]*\).*/\1/p' "$OUT/agent-$k.json"; done |
+for k in $(seq 1 "$n"); do wall_means "$OUT/agent-$k.json"; done |
   awk 'NR % 2 { f += $1 } !(NR % 2) { r += $1 }
     END { printf "\nThe whole session: ffs %.1f ms, ripgrep %.1f ms.\n", f * 1000, r * 1000 }' >> "$TABLE"
 cat "$TABLE"

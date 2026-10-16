@@ -8,12 +8,14 @@ code works see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 Environment: macOS 27.0.1, Apple M5, Homebrew.
 
-> **Experiments 1–14 run on macOS; Experiment 15 runs on Linux.** "Linux" in
-> the tables below always means the *Linux kernel source tree* used as a
-> fixture (`fixtures/linux`), not the Linux operating system. Conclusions
-> about threads and system time in Experiments 1–14 are about macOS / APFS.
-> Experiment 15 has its own environment table, and its numbers live in
-> `results-linux/`, never mixed with the macOS ones in `results/`.
+> **Experiments 1–14 and 16 run on macOS; Experiment 15 runs on Linux.**
+> "Linux" in the tables below always means the *Linux kernel source tree*
+> used as a fixture (`fixtures/linux`), not the Linux operating system.
+> Conclusions about threads and system time in Experiments 1–14 and 16 are
+> about macOS / APFS. Experiment 15 has its own environment table, and its
+> numbers live in `results-linux/`; Experiment 16 re-measures this Mac with
+> the current code into `results-macos/`. `results/` stays as Experiments
+> 1–14 left it.
 
 | Tool | Version | Path | Install |
 |---|---|---|---|
@@ -1098,23 +1100,281 @@ hand-allocated items.
 - macOS was **not** re-measured with the new walk. The `results/` tables are
   still the one-task-per-directory design on an M5; `-j auto` there is
   unchanged (4 performance cores), and whether a queue helps a machine where 4
-  threads was already optimal is an open question.
+  threads was already optimal is an open question (answered in Experiment 16).
 - `ack` is missing from the Linux tables, and the `ignore-case-*`,
   `*-matcher`, `*-content`, `size-variants-*` and `syscalls-*` files in
   `results/` have no script, so they have no Linux counterpart.
 
+## Experiment 16 — macOS again: the worker-pool walk on the M5
+
+Experiment 15 rewrote the walk for Linux and left macOS un-measured. The
+question it left: on a machine where 4 threads was already the optimum
+(Experiment 12) and system time is ~95% of the work (Experiment 13), does a
+shared work queue buy anything? Same M5, macOS 27.0.1, same Homebrew
+ripgrep 15.2.0, ack 3.10 and BSD grep as in Setup; hyperfine is now **2.0.0**
+(see below). Current `main` (4681f99), which is the pool walk plus
+everything since: ripgrep's command line, the multi-literal regex prefilter,
+the ignore-file hardening.
+
+Every script in `bench/` was run with `OUT=results-macos`; `bench/h2h.sh`
+with `1,2,4,6,8,10`, this machine's thread counts. `results/` is left as
+Experiments 1–14 wrote it. All numbers below are **medians**, not means:
+on the kernel tree, runs here are bimodal (most near the median, a few
+taking 2–8x as long), and the mean mostly measures how many slow runs a
+command happened to draw.
+
+### Old walk against new, in alternating rounds
+
+Experiment 13 showed that on this machine the order commands run in can
+matter more than the code, so the direct answer comes from an A/B, not from
+comparing today's run with the old `results/`. Three builds: 263bd0b (one
+task per directory, the last commit before the pool), f279c41 (the pool,
+Experiment 15) and `main`. Eight rounds, each running the three one after
+another (5 kernel runs, 20 redis runs each), pooled
+(`results-macos/ab/`):
+
+| Search | one task per directory | worker pool | `main` | pool wins |
+|:---|---:|---:|---:|---:|
+| Linux `PM_RESUME`, `-j auto` (= 4) | 1,159 ms | 1,166 | 1,146 | 3 / 8 rounds |
+| Redis `dictFind`, `-j auto` | 18.0 ms | **15.0** | 15.4 | **8 / 8** |
+| Linux `PM_RESUME`, `-j1` | 1,696 ms | 1,893 | 1,677 | 1 / 4 |
+| Redis `dictFind`, `-j1` | 21.6 ms | 21.7 | 21.3 | 2 / 4 |
+
+- **On the kernel tree, nothing.** All three builds land within 2% of each
+  other, and the round medians swing from 853 to 2,122 ms for the *same*
+  binary. The long serial tail that the queue fixed on 16 Linux threads
+  does not exist with 4 workers: there are few enough of them that the big
+  directories are always shared out anyway, and the bottleneck is APFS, not
+  scheduling (system time is 3.2–3.7 s for 1.1 s of wall, user 130 ms).
+- **On redis, 17% faster**, in every round. 1,680 files is small enough
+  that per-directory setup was a visible part of the run, and this is the
+  per-worker `Local` (one 256 KiB buffer per worker, not one per directory)
+  rather than the queue.
+- **Single-threaded, no change.** Linux gained 13% at `-j1` from the same
+  per-worker buffer; on macOS the allocation was never the cost, `open` is.
+- The kernel-tree medians here (~1.15 s) are slower than the same command
+  elsewhere in this experiment (~0.87 s): the A/B ran while the machine was
+  busiest (see Caveats). Only the comparison within one table holds.
+
+### Thread count
+
+`bench/threads.sh` (`results-macos/threads-*.json`), against Experiment 12:
+
+| `-j` | auto (= 4) | 1 | 2 | 3 | 4 | 5 | 6 | 8 | 10 |
+|:---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Linux `PM_RESUME`, now | 941 ms | 1,819 | **1,114** | 1,123 | 1,128 | 1,293 | 1,429 | 1,932 | 1,845 |
+| Linux, Experiment 12 | **891** | 1,625 | 1,332 | 991 | 955 | 1,328 | 1,336 | 2,017 | 2,130 |
+| Redis `dictFind`, now | **11.7 ms** | 20.7 | 15.5 | 12.9 | 14.8 | 15.5 | 15.3 | 15.3 | 15.4 |
+| Redis, Experiment 12 | 15.3 | 21.6 | 17.8 | 16.1 | **15.3** | 16.3 | 16.5 | 16.7 | 17.1 |
+
+`-j auto` and `-j 4` are the same thread count, so the 941 against 1,128 ms
+(and 11.7 against 14.8) is this machine's noise; `bench/h2h.sh`'s own sweep
+has `-j4` at 935 ms and 12.1 ms. Read that way, **the curve has not moved**:
+2–4 threads is the plateau, and from 5 threads on, when the efficiency cores
+join, system time climbs (3.3 s at `-j4`, 7.3 s at `-j6`, 12 s at `-j8`) and
+wall time follows. Experiment 12's hypothesis holds with the new walk:
+`auto` = performance cores is right on this M5, and it is the opposite of
+Linux, where every added thread helped.
+
+### ffs and ripgrep at the same thread count
+
+`bench/h2h.sh`, kernel tree, `PM_RESUME`:
+
+| `-j` | 1 | 2 | 4 | 6 | 8 | 10 |
+|:---|---:|---:|---:|---:|---:|---:|
+| ffs | 2,557 ms | **1,182** | 935 | 1,408 | 1,766 | 2,102 |
+| ripgrep | **2,018** | 1,220 | **848** | **1,320** | 1,762 | **1,875** |
+
+Within noise of each other at every count, both best at 4, both 2x slower
+at 10. Unlike Linux, there is no algorithmic gap left to show: both tools
+spend their time waiting on the same `open` calls. (The `-j1` row is the
+bimodal case at its worst — ffs's own sweep had `-j1` at 1,819 ms an hour
+earlier.)
+
+### Literal search
+
+`bench/searches.sh`, kernel tree, each tool as normally run:
+
+| Query | ffs | ffs `-j1` | `rg -uu` | `ack` | `grep -rI` |
+|:---|---:|---:|---:|---:|---:|
+| Rare `PM_RESUME` | **919 ms** | 1,549 | 2,133 | 3,973 | 8,042 |
+| Common `ERR_PTR` | **823** | 1,938 | 2,141 | 13,674 | 14,274 |
+| No match `zqxjvkwqz` | **891** | 1,576 | 2,077 | 9,247 | 11,966 |
+| Long `#include <linux/module.h>` | **816** | 3,424 | 1,964 | 14,193 | 14,668 |
+
+`bench/h2h.sh`, with ripgrep held to 4 threads:
+
+| Query | ffs | ffs `-j4` | `rg -uu` | `rg -uu -j4` |
+|:---|---:|---:|---:|---:|
+| Rare `PM_RESUME` | 870 ms | 866 | 2,043 | **845** |
+| Common `ERR_PTR` | **855** | 874 | 1,962 | 950 |
+| No match `zqxjvkwqz` | 890 | 876 | 1,908 | **868** |
+| Long `#include <linux/module.h>` | 852 | **838** | 1,801 | 978 |
+| `-i PM_RESUME` | **928** | — | 1,841 (`-i`) | — |
+
+The same picture as Experiments 7–12: 2.2–2.4x ahead of ripgrep as each is
+normally run, because ripgrep uses all 10 cores and macOS punishes that, and
+a tie with `rg -j4` (±10%, either way). ffs, its default and `-j4` are the
+same thing here, as they should be.
+
+Redis (`bench/bench.sh`, then `bench/h2h.sh`):
+
+| | ffs | ffs `-j1` | rg | ack | grep |
+|:---|---:|---:|---:|---:|---:|
+| Defaults | **15.3 ms** | — | 19.7 | 105.1 | 138.2 |
+| All text files, nothing ignored | **15.7** | 24.4 | 18.7 (`-uu`) | 93.2 | 97.6 (`-rI`) |
+| Same, `bench/h2h.sh` | **11.7** | — | 18.4 (`-uu`) | — | — |
+
+The same command took 15.7 ms in one script and 11.7 ms in another, half an
+hour apart: on redis the machine's state moves the number more than any
+change in this experiment except the A/B above.
+
+### Regex
+
+`bench/regex.sh`, kernel tree unless marked redis; `rg -P` from
+`bench/h2h.sh`; "before" is `ffs -E` in `results/` (Experiment 11, macOS):
+
+| Pattern | ffs | before | `rg -uu -j4` | `rg -uu` | `rg -uu -P` |
+|:---|---:|---:|---:|---:|---:|
+| `PM_[A-Z_]+` | 1,020 ms | 868 | **864** | 2,063 | 1,621 |
+| `\bERR_PTR\(-E[A-Z]+\)` | **872** | 875 | 946 | 2,053 | — |
+| `\w+_lock_irqsave\(` | 899 | 930 | **891** | 2,078 | 1,562 |
+| `(spin\|mutex)_lock\(` | **871** | 905 | 927 | 1,979 | — |
+| `^\s*#\s*define\s+[A-Z_]+\s+0x[0-9a-fA-F]+` | 1,179 | 1,167 | **942** | 1,988 | 1,589 |
+| `[0-9a-f]{16}` | 2,386 | 2,304 | **1,167** | 1,597 | 1,572 |
+| `-i todo\|fixme` | **874** | 1,921 | 884 | 1,817 | — |
+| redis `dict(Find\|Delete)\(` | **12.0** | 18.5 | 15.5 | 18.7 | — |
+| redis `[0-9]{3,}` | **16.1** | 24.6 | 20.9 | 23.6 | — |
+
+- **`-i todo|fixme` went from 2.2x behind `rg -j4` to a tie** (1,921 →
+  874 ms). That is the multi-literal prefilter (6522b74), not the walk: it
+  was the case Experiment 15 named as the strongest argument for one, and on
+  this machine it closes the gap completely.
+- Patterns with a literal tie `rg -j4`, as before; `PM_[A-Z_]+` at 1,020 ms
+  is one noisy run, `bench/h2h.sh` has it at 870.
+- **No literal, still behind**: `[0-9a-f]{16}` 2.0x behind `rg -j4`, the
+  `#define` pattern 1.25x. That is the Pike VM (user time 6.4 s against
+  ripgrep's 2.0 s), and it is the same gap as before.
+- Redis gained ~35% on both. The A/B puts the walk's share at 17%; the rest
+  is between-session drift (see the redis table above), not a regex change.
+- BSD grep for scale: `PM_[A-Z_]+` 846 ms against 9,244 (11x), and
+  `[0-9a-f]{16}` 2,615 against 29,160 (11x).
+
+### An agent's session
+
+`bench/agent.sh`, from inside the redis checkout (`results-macos/agent.md`),
+the first macOS run of it:
+
+| # | What the agent wants | ffs | ripgrep | |
+|---:|:---|---:|---:|:---|
+| 1 | Find the build files and docs | **2.4 ms** | 6.0 ms | 2.5x faster |
+| 2 | Look for agent instructions | **2.5** | 6.5 | 2.6x faster |
+| 3 | Guess a symbol's name | **5.4** | 10.2 | 1.9x faster |
+| 4 | Jump to a declaration | **1.3** | 2.2 | 1.6x faster |
+| 5 | Read a function body | **1.4** | 2.3 | 1.6x faster |
+| 6 | Spell out case variants | **6.6** | 10.3 | 1.6x faster |
+| 7 | Search the whole repo | **11.7** | 19.3 | 1.6x faster |
+| 8 | Count uses per file | **5.4** | 10.1 | 1.9x faster |
+| 9 | Which files call it | **5.3** | 10.0 | 1.9x faster |
+| 10 | Whole word only | **5.6** | 10.1 | 1.8x faster |
+| 11 | Pull out IDs | **5.6** | 10.3 | 1.9x faster |
+| 12 | Tests that mention it | **2.9** | 6.5 | 2.2x faster |
+| 13 | Read a saved test log | **2.4** | 3.4 | 1.4x faster |
+| 14 | Regex with no literal | 15.9 | **10.9** | 1.5x slower |
+| 15 | Alternation with a common word | **5.6** | 10.4 | 1.9x faster |
+
+**The whole session: ffs 80.1 ms, ripgrep 128.4 ms** (Linux: 82 against
+94). The calls agents make are small, so the Mac's penalty for using every
+core shows up as ripgrep's ~10 ms floor on anything that walks `src/`, and
+ffs's 4 workers avoid it. The regex with no literal costs 5 ms here against
+10 ms on Linux.
+
+The first run of this script printed a table of absurd times (ffs
+"20,666,368,039 ms"). **hyperfine 2.0 writes JSON schema 2**, where each
+result has a `summary` with a `mean` for every metric (CPU cycles,
+instructions, memory, then times), and `agent.sh` took the first `"mean"` it
+found — the cycle count. `agent.sh` now reads the mean under
+`time_wall_clock` when the file has a `schema_version`, and the old one
+otherwise; it gives the same numbers as before on `results-linux/`. The
+other scripts only export JSON, so their files are fine, but anything that
+reads `results-macos/*.json` must use the new layout (`results/` and
+`results-linux/` are schema 1).
+
+### The matcher alone
+
+`bench/match.sh`, best of 7, single-threaded, 512 MB in memory:
+
+| Term | sensitive | insensitive | Linux (Exp. 15), sensitive / insensitive |
+|:---|---:|---:|---:|
+| `PM_RESUME` | **18.67 ms, 27.4 GB/s** | 22.08, 23.2 | 11.7 / 18.4 GB/s |
+| `ERR_PTR` | **18.60, 27.5** | 26.15, 19.6 | 11.6 / 16.3 |
+| `zqxjvkwqz` | **16.40, 31.2** | 16.87, 30.4 | 12.6 / 21.8 |
+| `#include <linux/module.h>` | **16.95, 30.2** | 17.30, 29.6 | 12.1 / 21.3 |
+| `the` | **21.37, 24.0** | 24.53, 20.9 | 11.1 / 17.1 |
+| `e` | **103.46, 4.95** | 112.00, 4.57 | 5.15 / 4.92 |
+
+- Unchanged from Experiment 8 (18.36 ms on `PM_RESUME` then).
+- **On the M5 the case-sensitive path is faster than `-i`**, by 2–40%, as it
+  should be. Experiment 15's backwards result (`-i` 1.4–1.7x *faster*) is
+  therefore x86-specific: same source, so it is in what the 16-byte vector
+  code compiles to for AVX2 — the sensitive path is probably leaving work
+  on the table there, not the insensitive one doing something clever. That
+  narrows the experiment Experiment 15 asked for.
+- On realistic terms the M5's single core searches at 24–31 GB/s, 2.3x the
+  Ryzen's; end to end the Mac is 11x slower on the kernel tree. All of that
+  is the filesystem.
+
+### Memory
+
+Peak RSS on the kernel tree is **3.9 MB**, down from 7.7 MB (`results/`,
+Experiment 12): four buffers instead of one per directory in flight.
+`rg -uu -j4` is 9.8 MB and `rg -uu` 12.4 MB. The regex with a big VM state
+(`#define`) peaks at 11.1 MB. Redis: 3.3 MB, from 4.1.
+
+### Correctness
+
+`bench/h2h.sh`'s match counts agree with ripgrep on all six queries, the
+same numbers as on Linux (38; 17,569; 0; 114,746; 17,005; 16,957).
+`bench/agent.sh` checks that ffs and ripgrep give identical output on all
+15 calls before timing them, and it passed. The three A/B builds give the
+same 119 lines on redis `dictFind`.
+
+### Conclusion
+
+On the M5 **the worker pool is a wash on the large tree and a 17% win on the
+small one**, and the win is the per-worker buffer, not the queue. Keeping it
+costs nothing here; Experiment 15 is the reason it exists. `-j auto` is
+still right on both machines, for opposite reasons. The multi-literal
+prefilter, measured here on macOS for the first time, removed the worst
+regex loss. The no-literal patterns are still 1.25–2x behind ripgrep.
+
+### Caveats
+
+- **A busy machine.** The load average was 4–7 for the whole run (other
+  work was running; it was not stopped), which is the likeliest cause of the bimodal runs and
+  of the ~30% drift between scripts. The A/B, where every round runs all
+  three builds back to back, is the only table that cancels that out; the
+  others compare tools within one hyperfine call, which is fair to each
+  tool but not reproducible to better than ±15%.
+- One Mac, warm cache, APFS on the internal SSD.
+- The A/B binaries were built from worktrees at 263bd0b and f279c41, with
+  their own command line (`ffs [-j N] DIR TERM`), so `-uu` was not needed
+  there; the JSON in `results-macos/ab/` has the exact commands.
+- `README.md`'s macOS column (0.84–0.87 s literal, 2.30 s hex) still holds
+  within this noise, so it was left alone.
+
 ## Next steps
 
 - Run on more machines: `bench/threads.sh` on another Mac (does `-j auto`
-  land on the best `-j`? see Experiment 12). Linux is now covered by
-  Experiment 15, on one 16-thread box.
-- Re-measure macOS with the worker-pool walk (Experiment 15): on an M5, 4
-  threads was already the optimum, so the queue may buy nothing there — but
-  the per-worker `Local` should still help, and `results/` currently
-  describes the old design.
-- Regex without a literal: this is now the largest gap on Linux (3.3–4.8x,
-  Experiment 15). A multi-literal prefilter (`todo|fixme`), or a lazy DFA if
-  the code size is acceptable.
+  land on the best `-j`? see Experiment 12; Experiment 16 confirms it again
+  on the M5 with the new walk). Linux is covered by Experiment 15, on one
+  16-thread box.
+- Case-sensitive matcher on x86: 1.4–1.7x slower than `-i` on the Ryzen,
+  2–40% faster on the M5 (Experiment 16). Look at what the AVX2 build emits.
+- Regex without a literal: this is now the largest gap on both machines
+  (Linux 1.5–10x, Experiment 15; macOS 1.25–2x, Experiment 16). The
+  multi-literal prefilter closed `todo|fixme`; what is left needs a lazy
+  DFA, if the code size is acceptable.
 - Ignore files (`.gitignore`), probably as an option, since searching
   everything is the point of the current benchmarks.
 - Unicode: case folding for `-i`, Unicode `\w`/`\b` for `-E`.
