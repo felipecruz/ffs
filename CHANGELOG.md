@@ -1,5 +1,7 @@
 # Changelog
 
+## 0.0.10 — unreleased
+
 ## 0.0.9 — 2026-10-25
 
 Regexes with no fixed text, the one kind of search where ripgrep was
