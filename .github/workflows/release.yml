@@ -1,6 +1,6 @@
 name: Release
 
-# Tagging `v0.0.8` builds every target from one Linux runner (Zig
+# Tagging `v0.0.9` builds every target from one Linux runner (Zig
 # cross-compiles) and attaches the archives to a GitHub release. The release
 # notes are the matching CHANGELOG section, so the tag, build.zig and the
 # CHANGELOG have to agree — the first job fails if they do not.

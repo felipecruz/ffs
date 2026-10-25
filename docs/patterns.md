@@ -71,24 +71,35 @@ allows. Knowing the routes helps when a search is slow.
    SIMD search, 16 bytes at a time. This is the fastest kind of search.
 2. **A regex with fixed text in it** (`PM_[A-Z_]+`, `dictFind\(`): the SIMD
    search finds the lines that contain the text (`PM_`, `dictFind(`), and
-   only those lines go to the regex engine.
+   only those lines go to the regex engine. When there are several pieces
+   to choose from, ffs takes the one that should be rarest in source code.
 3. **Alternatives with fixed text** (`dictFind|dictAdd|dictDelete`,
    `func (cancel|launch)`): the same, with up to 16 pieces of text searched
    for at once. When the pattern is nothing but alternatives of plain text,
    the regex engine is skipped altogether.
-4. **No fixed text** (`[0-9a-f]{16}`, `\d+`): every line goes through the
-   regex engine. This is the slow case, where ripgrep is several times
-   faster (see the README's tables).
+4. **No fixed text, but a run of one class** (`[0-9a-f]{16}`,
+   `[A-Za-z_]{30,}`, `\d{5,}`): a SIMD scan finds the lines with a long
+   enough run (16 hex digits in a row), and only those go further. When the
+   pattern is just the run, nothing else is checked.
+5. **Neither** (`\d+`, `^\s*$`): the regex
+   engine reads every byte, as a DFA built while it searches, one table
+   lookup per byte.
 
-Within route 3, a very common piece of text slows things down: in
+The regex engine is a lazy DFA, with a Pike VM behind it. Patterns with
+`\b` (and so `-w`) can't use the DFA and run on the VM, which steps every
+possible match at once and is several times slower per line. That only
+shows when the fixed text is common: `-w dictFind` is fast, but
+`\b[a-z]+_[a-z]+\b`, whose only fixed text is `_`, sends most lines to the
+VM and is about 4x slower than ripgrep. Within routes 2 and 3, a very
+common piece of text slows things down the same way: in
 `dictFind|struct [a-z]+ \{`, every line with `struct ` is a candidate. If you
 can, spell out a rarer part.
 
 ## The PCRE2 build
 
 `zig build -Dpcre2=true` links the system's PCRE2 (`libpcre2-8`) and lets its
-JIT compiler do the regex engine's work in routes 2–4. The syntax and the
-results stay the same: ffs still parses every pattern itself, and patterns
-with `\b` keep the built-in engine, whose `\b` matches ripgrep's. It closes
-most of the gap in route 4 and wins where route 3 has a common piece of
-text; the README has the numbers.
+JIT compiler take over where the DFA can't: patterns whose DFA would need
+too many states, and `-o`. The syntax and the results stay the same: ffs
+still parses every pattern itself, and patterns with `\b` keep the built-in
+engine, whose `\b` matches ripgrep's. Since the DFA, the two builds are
+within a few percent of each other; the README has the numbers.

@@ -43,7 +43,7 @@ typedef int (*ffs_callback)(void *ctx, const ffs_match *m);
 int ffs_search(const char *root, const char *term, unsigned flags,
                unsigned threads, ffs_callback cb, void *ctx);
 
-/* The library version, e.g. "0.0.8". */
+/* The library version, e.g. "0.0.9". */
 const char *ffs_version(void);
 
 #ifdef __cplusplus

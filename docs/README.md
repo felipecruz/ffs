@@ -43,7 +43,7 @@ To download one, check it against the release's `SHA256SUMS`, and install
 it in `~/.local`:
 
 ```sh
-v=0.0.8 t=x86_64-linux-gnu
+v=0.0.9 t=x86_64-linux-gnu
 url=https://github.com/felipecruz/ffs/releases/download/v$v
 curl -LO "$url/ffs-$v-$t.tar.gz" -LO "$url/SHA256SUMS"
 grep " ffs-$v-$t.tar.gz\$" SHA256SUMS | sha256sum -c    # macOS: shasum -a 256 -c

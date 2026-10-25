@@ -1,5 +1,60 @@
 # Changelog
 
+## 0.0.9 — 2026-10-25
+
+Regexes with no fixed text, the one kind of search where ripgrep was
+several times faster, are now faster in ffs too. On the Linux kernel,
+`[0-9a-f]{16}` takes 97 ms (0.0.8: 1.3 s; ripgrep 281 ms), and on the
+LLVM monorepo ffs is faster than ripgrep on all 21 searches of the new
+`bench/llvm.sh`, 1.2x to 3.6x. EXPERIMENTS.md, Experiment 17, has every
+step and number.
+
+**Regex**
+
+- A lazy DFA (`src/dfa.zig`) answers "does this line match?" in one table
+  lookup per byte, building its states while it searches. It checks the
+  lines the literal prefilter finds and scans whole files when a regex has
+  no fixed text. Patterns with `\b` stay on the Pike VM, as do patterns
+  that need too many states (the DFA notices and gives up).
+- A SIMD scan for runs of one character class is the prefilter for regexes
+  with no fixed text that need such a run (`[0-9a-f]{16}`,
+  `[A-Za-z_]{30,}`, `\d{5,}`). LLVM `[A-Za-z_]{30,}`: 1,038 ms to 156 ms
+  (ripgrep 478).
+- Of the pieces of fixed text a regex requires, the prefilter now uses the
+  one that should be rarest in source code, not the longest.
+- The default and PCRE2 builds are now within a few percent of each other;
+  PCRE2 is used where the DFA can't answer.
+
+**Search**
+
+- The SIMD search compares a term's two rarest bytes when its first and
+  last are common, from a byte-frequency table of real source trees:
+  `class \w+ : public \w+` on LLVM went from 210 ms to 125 ms (ripgrep
+  178).
+
+**Hardening**
+
+- `.gitignore` lines and `-g` globs: `**` is matched with a state set
+  instead of backtracking (`**a**a**a**a**b` hung ffs), patterns are capped
+  at 4096 bytes and brace expansion is bounded; ignore-file lines that are
+  too complex are skipped, a `-g` glob that is too complex is an error.
+- Regexes nested deeper than 250 are rejected (they overflowed the stack),
+  and repeats of an empty body (`(){4294967295}`) no longer loop.
+- PCRE2 JIT and match-limit errors fall back to the Pike VM instead of
+  counting as "no match".
+- Running out of memory during the walk exits 2, not 1; the C API reports
+  it as `FFS_ENOMEM` or `FFS_EROOT`.
+
+**Docs and benchmarks**
+
+- A terminal demo (`docs/demo.gif`) and install instructions for the
+  release archives.
+- `bench/llvm.sh` and the LLVM fixture; the kernel, Redis and LLVM suites
+  re-measured on Linux (`results-linux/`), and the macOS suite with the
+  worker-pool walk (`results-macos/`, Experiment 16).
+- Known slow case: a `\b` pattern whose only fixed text is common,
+  `\b[a-z]+_[a-z]+\b` on the kernel, 2.4 s against ripgrep's 0.65 s.
+
 ## 0.0.8 — 2026-10-15
 
 First release: a file searcher with ripgrep's command line, for the flags
