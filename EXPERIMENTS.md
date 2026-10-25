@@ -1560,6 +1560,18 @@ and that an exact run is the whole answer.
   ffs's Unicode `\b` needs the DFA to fall back only on non-ASCII bytes.
 - A DFA skip loop: while the DFA sits in its start state, jump with SIMD to
   the next byte that can start a match (`first`), as the Pike VM does.
+- ffs as Claude Code's ripgrep, in shadow mode first. ffs now takes every
+  command line the Grep tool passes (`--json`, `--null`, `--max-columns`,
+  `-t`, `--iglob`; see `docs/ripgrep.md`) and hands the rest to `FFS_RG`.
+  Next, an `rg` shim on `PATH` (with `USE_BUILTIN_RIPGREP=0`) that runs
+  both tools on every call, returns ripgrep's output, and logs the command
+  line, both timings and any difference in output (timings in `--json`
+  taken out). A few days of real sessions would show the differences
+  `tests/compat.sh` misses and the time saved per call. Once the log is
+  clean, the shim returns ffs's output and keeps ripgrep as the fallback.
+  Known difference to fix first: a binary file under `--json`, where
+  ripgrep reports the matches before the NUL and `binary_offset` and ffs
+  prints nothing.
 - Ignore files (`.gitignore`), probably as an option, since searching
   everything is the point of the current benchmarks.
 - Unicode: case folding for `-i`, Unicode `\w`/`\b` for `-E`.
