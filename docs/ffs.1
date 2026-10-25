@@ -123,6 +123,46 @@ instead of
 after the path and line number, and
 .Ql --
 separates groups of lines that are not next to each other.
+.It Fl -json
+Print matching lines, and context lines, as ripgrep's JSON Lines
+messages: a
+.Ql begin
+and an
+.Ql end
+message around each file's
+.Ql match
+and
+.Ql context
+messages, and a
+.Ql summary
+last.
+Text that is not valid UTF-8 is given base64-encoded, as
+.Ql bytes .
+Lines are numbered unless
+.Fl N
+is given.
+With
+.Fl c ,
+.Fl l ,
+.Fl q
+or
+.Fl -files
+this flag does nothing.
+.It Fl 0 , Fl -null
+Print a NUL byte after each path instead of
+.Ql \&:
+(or, with
+.Fl l
+and
+.Fl -files ,
+instead of a newline).
+.It Fl M Ar num , Fl -max-columns Ns = Ns Ar num
+Print a line longer than
+.Ar num
+bytes, its newline included, as
+.Ql [Omitted long matching line]
+(or
+.Ql [Omitted long context line] ) .
 .It Fl -color Ns = Ns Ar when , Fl -colour Ns = Ns Ar when , Fl -heading , Fl -no-heading , Fl -no-messages
 Accepted for compatibility and ignored:
 .Nm
@@ -156,6 +196,28 @@ matches the file name at any depth.
 A glob that matches a path takes precedence over ignore files and the
 hidden-file rule.
 Repeat for several globs; the last one that matches decides.
+.It Fl -iglob Ns = Ns Ar glob
+Like
+.Fl g ,
+with ASCII letters matching either case.
+.It Fl t Ar type , Fl -type Ns = Ns Ar type
+Only search files of
+.Ar type ,
+ripgrep's file types: a file has a type when its name matches one of the
+type's globs
+.Pq Fl -type-list .
+.Cm all
+is any type.
+Repeat for several types.
+Files named on the command line are searched whatever their type, and a
+matching
+.Fl g
+glob takes precedence.
+.It Fl T Ar type , Fl -type-not Ns = Ns Ar type
+Do not search files of
+.Ar type .
+.It Fl -type-list
+Print the file types and their globs.
 .It Fl \&. , Fl -hidden
 Also search hidden files and directories.
 .It Fl -no-hidden
@@ -254,6 +316,19 @@ a group
 .It Li (?i)
 ignore case from here to the end of the group
 .El
+.Sh ENVIRONMENT
+.Bl -tag -width Ds
+.It Ev FFS_RG
+The path of a ripgrep binary.
+A command line
+.Nm
+can't run itself (multi-line search, sorting, following symbolic links,
+any flag it doesn't know) is then run by it, unchanged, so that
+.Nm
+can stand in for
+.Xr rg 1
+everywhere.
+.El
 .Sh EXIT STATUS
 .Bl -tag -width Ds -compact
 .It 0
@@ -299,14 +374,18 @@ are ASCII only.
 treats non-ASCII letters as word characters, as ripgrep does.
 A file with a NUL byte is skipped entirely, where ripgrep prints the
 matches before the NUL.
-Not supported: file types
-.Pq Fl t ,
-sorting, JSON output, replacement
+Not supported, except through
+.Ev FFS_RG :
+sorting
+.Pq Fl -sort ,
+adding file types
+.Pq Fl -type-add ,
+replacement
 .Pq Fl r ,
 multi-line search
 .Pq Fl U ,
 following symbolic links
 .Pq Fl L ,
-PCRE syntax
-.Pq Fl P ,
-and the global git ignore file.
+and PCRE syntax
+.Pq Fl P .
+The global git ignore file is not read.

@@ -48,6 +48,9 @@ $ ffs -n -B1 -A2 'void serverLogRaw\(' src/server.c
 | `-q` | nothing; the exit status says if something matched |
 | `-m N` | at most N matching lines per file |
 | `-v` | the lines that don't match (with `-c`: how many) |
+| `--json` | ripgrep's JSON Lines messages for the matching lines, for programs |
+| `--null` (`-0`) | a NUL byte after each path instead of `:`, or of the newline with `-l` |
+| `-M N` | `[Omitted long matching line]` for lines longer than N bytes |
 
 ```console
 $ ffs -o -N 'CVE-[0-9]{4}-[0-9]+' 00-RELEASENOTES | sort -u | tail -3

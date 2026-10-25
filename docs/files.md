@@ -110,6 +110,30 @@ $ ffs --files --hidden -g '.github/workflows/c*'
 .github/workflows/coverity.yml
 ```
 
+## Choosing files by type with `-t`
+
+`-t TYPE` keeps only files of a type, by name: ripgrep's table of types
+(`ffs --type-list`), such as `c` (`*.[chH]`, …), `py` or `make`
+(`Makefile`, `*.mk`, …). `-T TYPE` leaves a type out, and both can be
+repeated. `--iglob` is `-g` ignoring case.
+
+```console
+$ ffs --files -t make -d 2 | sort
+Makefile
+deps/Makefile
+modules/Makefile
+modules/common.mk
+src/Makefile
+$ ffs -c -t tcl lazyfree tests | sort -t: -k2 -rn | head -3
+tests/unit/lazyfree.tcl:27
+tests/unit/moduleapi/test_lazyfree.tcl:4
+tests/unit/functions.tcl:4
+```
+
+As in ripgrep, a file named on the command line is searched whatever its
+type, a matching `-g` glob decides on its own, and a selected type brings
+back a hidden file the way a matching glob does.
+
 ## Listing files with `--files`
 
 `--files` prints every file a search would look at, and takes no pattern. With

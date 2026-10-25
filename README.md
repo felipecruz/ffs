@@ -5,7 +5,7 @@
 **ripgrep's command line, in about 3,000 lines of Zig.** It takes the
 flags coding agents actually use (`-n`, `-g`, `--files`, `-o`, `-c`, `-l`,
 `-v`, `-A/-B/-C`, …), respects `.gitignore`, and prints exactly what
-ripgrep prints (`tests/compat.sh` checks 97 command lines). It is faster
+ripgrep prints (`tests/compat.sh` checks 124 command lines). It is faster
 than ripgrep on every search benchmarked below, on the Linux kernel, Redis
 and LLVM trees, regexes included; the one kind of regex where it is still
 slower is under Limitations.
@@ -160,7 +160,7 @@ faster than ripgrep on all 21 searches in `bench/llvm.sh`, 1.2x to 3.6x
 
 `zig build -Dpcre2=true` links the system's PCRE2 and lets its JIT do the
 work the lazy DFA can't: patterns with `\b` (`-w`), and patterns whose DFA
-would need too many states. Matching rules don't change (the same 97 compat
+would need too many states. Matching rules don't change (the same 124 compat
 checks pass), but the binary needs libpcre2-8 installed. Since the DFA,
 the two builds are within a few percent of each other (table above). On
 the agent session, the PCRE2 build takes **56 ms against ripgrep's 89 ms**
@@ -179,13 +179,14 @@ the agent session, the PCRE2 build takes **56 ms against ripgrep's 89 ms**
 
 | File | Code lines | What it does |
 |---|---:|---|
-| `src/main.zig` | 411 | ripgrep's command line (a quarter of it the `--help` text) |
-| `src/walk.zig` | 321 | Parallel directory walk: worker pool over one queue; hidden, ignore files, `-g` |
-| `src/glob.zig` | 229 | Globs and gitignore rules |
-| `src/search.zig` | 427 | Thread pool; stream each file, skip binaries, ripgrep's output modes |
+| `src/main.zig` | 511 | ripgrep's command line (a quarter of it the `--help` text); hands what it can't run to `FFS_RG` |
+| `src/walk.zig` | 326 | Parallel directory walk: worker pool over one queue; hidden, ignore files, `-g`, `-t` |
+| `src/glob.zig` | 306 | Globs and gitignore rules |
+| `src/search.zig` | 601 | Thread pool; stream each file, skip binaries, ripgrep's output modes and `--json` |
 | `src/match.zig` | 372 | SIMD search: one term or several, or a run of a character class |
 | `src/regex.zig` | 827 | Regex: parser, literal and class-run prefilters, Pike VM |
 | `src/dfa.zig` | 249 | Lazy DFA: one table lookup per byte to check a line or scan a buffer |
+| `src/types.zig` | 227 | ripgrep's file types for `-t`/`-T`, as data |
 | `src/c_api.zig` | 95 | Optional C library (`include/ffs.h`) |
 | `src/pcre.zig` | 48 | Optional PCRE2 JIT backend (`-Dpcre2=true`) |
 
@@ -228,7 +229,11 @@ ffs --files [OPTIONS] [PATH...]
 
 The same command line as ripgrep, for the flags ffs has (`ffs --help` lists
 them): `-e -F -i -S -s -w -x -v`, `-n -N -H -I -o -c -l -q -m`, `-A -B -C`,
-`--files -g --hidden --no-ignore --no-ignore-vcs -u -a -d -j`. PATTERN is a
+`--json --null -M`, `--files -g --iglob -t -T --hidden --no-ignore
+--no-ignore-vcs -u -a -d -j`. With `FFS_RG` naming a ripgrep binary, a
+command line ffs can't run (`-U`, `--sort`, `-L`, …) is handed to it, so ffs
+can stand in for `rg` everywhere, Claude Code's own search tools included
+([docs/ripgrep.md](docs/ripgrep.md#using-ffs-as-rg)). PATTERN is a
 regex (`. [a-z] [^0-9] [[:alpha:]] \d \w \s \b ^ $ * + ? {n,m} *? | ( ) (?:)
 (?i)`); one with no regex syntax in it goes straight to the SIMD search.
 With no PATH, ffs searches standard input if something is piped in, else

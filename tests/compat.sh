@@ -32,6 +32,7 @@ printf 'secret\n' > docs/.ignore
 printf 'foo secret\n' > docs/secret
 printf 'foo public\n' > docs/public
 printf 'bin\0ary foo\n' > binary.dat
+printf 'esc foo\t\x01"q"\\b\x1b\r end\n' > esc.txt
 # A '!' line beats the hidden check, as in the Linux kernel's .gitignore.
 mkdir -p k/sub
 printf '.*\n!.gitignore\n' > k/.gitignore
@@ -40,19 +41,32 @@ printf 'foo\n' > k/sub/.hidden
 
 pass=0
 fail=0
-# check [sort|raw] [--stdin TEXT] [--cd DIR] ARGS...
+RG=$(command -v rg)
+# Output filters: NUL bytes as newlines (the shell drops NULs), and --json
+# with its timings taken out, the one part that can't be the same.
+nul() { tr '\0' '\n'; }
+json() { sed -E 's/"elapsed(_total)?":\{[^}]*\}/"elapsed\1":{}/g'; }
+# check [sort|raw] [--stdin TEXT] [--cd DIR] [--filter nul|json] [--fallback] ARGS...
+# --fallback runs ffs with FFS_RG set, for command lines it hands to rg.
 check() {
   local mode=$1; shift
-  local input="" dir=.
-  [ "$1" = --stdin ] && { input=$2; shift 2; }
-  [ "$1" = --cd ] && { dir=$2; shift 2; }
+  local input="" dir=. filter=cat rgvar=
+  while :; do
+    case $1 in
+      --stdin) input=$2; shift 2 ;;
+      --cd) dir=$2; shift 2 ;;
+      --filter) filter=$2; shift 2 ;;
+      --fallback) rgvar=$RG; shift ;;
+      *) break ;;
+    esac
+  done
   local want got want_rc got_rc
   if [ -n "$input" ]; then
-    want=$(cd "$dir" && printf '%b' "$input" | rg "$@" 2>/dev/null); want_rc=$?
-    got=$(cd "$dir" && printf '%b' "$input" | "$FFS" "$@" 2>/dev/null); got_rc=$?
+    want=$(cd "$dir" && printf '%b' "$input" | rg "$@" 2>/dev/null | $filter; exit "${PIPESTATUS[1]}"); want_rc=$?
+    got=$(cd "$dir" && printf '%b' "$input" | FFS_RG=$rgvar "$FFS" "$@" 2>/dev/null | $filter; exit "${PIPESTATUS[1]}"); got_rc=$?
   else
-    want=$(cd "$dir" && rg "$@" </dev/null 2>/dev/null); want_rc=$?
-    got=$(cd "$dir" && "$FFS" "$@" </dev/null 2>/dev/null); got_rc=$?
+    want=$(cd "$dir" && rg "$@" </dev/null 2>/dev/null | $filter; exit "${PIPESTATUS[0]}"); want_rc=$?
+    got=$(cd "$dir" && FFS_RG=$rgvar "$FFS" "$@" </dev/null 2>/dev/null | $filter; exit "${PIPESTATUS[0]}"); got_rc=$?
   fi
   if [ "$mode" = sort ]; then
     want=$(sort <<<"$want")
@@ -170,6 +184,41 @@ check raw --stdin 'foo\nbar\nfoo2\n' -n foo
 check raw --stdin 'foo\nbar\n' -c foo
 check raw --stdin 'a\nb\n' foo
 check raw --stdin 'foo\nbar\n' -n foo -
+
+# Claude Code's Grep tool (2.1.296), as it calls rg: always --hidden, the
+# VCS directories left out and --max-columns 500; then -l and --null for
+# file names, -c -H --null for counts, or --json -n for lines.
+G=(--hidden --glob '!.git' --glob '!.svn' --glob '!.hg' --glob '!.bzr' --glob '!.jj' --glob '!.sl' --max-columns 500)
+check sort --filter nul "${G[@]}" -l --null foo .
+check sort --filter nul "${G[@]}" -l --null -i FOO .
+check sort --filter nul "${G[@]}" -c -H --null foo .
+check sort --filter json "${G[@]}" --json -n foo .
+check sort --filter json "${G[@]}" --json -n 'func (cancel|launch)' .
+check sort --filter json "${G[@]}" -i --json -n autopilot .
+check sort --filter json "${G[@]}" --json -n -o 'F[0-9]+' .
+check sort --filter json "${G[@]}" --json -n -C 1 m c.txt
+check sort --filter json "${G[@]}" --json -n -B 1 -A 2 m c.txt
+check sort --filter json "${G[@]}" --json -n -e -bar --glob '*.txt' .
+check sort --filter json "${G[@]}" --json -n foo --type swift .
+check sort --filter json "${G[@]}" --json -n func --glob '*.swift' --glob '!Tests/**' .
+check sort --filter json "${G[@]}" --json -n foo a/x.txt
+check sort --filter nul "${G[@]}" -l --null foo --type md .
+check sort --filter nul "${G[@]}" -l --null foo --iglob '*.TXT' .
+# Lines past --max-columns, and the rest of the new flags.
+check sort -n --max-columns 5 'foo|1' c.txt a/x.txt
+check sort --filter json --json --max-columns 5 foo .
+check raw --filter json --json foo esc.txt
+check sort -l foo -t md
+check sort -l foo -T md
+check sort --files -t swift
+check sort --files -t swift -g '*.txt'
+check sort --files --iglob '*.SWIFT'
+check raw --filter nul --files --null Sources
+check raw -t nosuchtype foo
+# Multiline and --sort aren't ffs's: with FFS_RG, ripgrep runs them, as
+# Claude Code's Grep tool (multiline: true) and Glob tool would call it.
+check raw --fallback --filter json "${G[@]}" -U --multiline-dotall --json -n 'cancel.*launch' Sources
+check raw --fallback --filter nul --files --null --glob '*.swift' --sort=modified --no-ignore --hidden
 
 echo "compat: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

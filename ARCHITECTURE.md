@@ -8,15 +8,16 @@ file's bytes: the 16-byte SIMD loop in `src/match.zig`. Measurements are in
 
 | File | Responsibility |
 |---|---|
-| `src/main.zig` | ripgrep's command line; turns the patterns into one literal or regex, calls `search.run` |
+| `src/main.zig` | ripgrep's command line; turns the patterns into one literal or regex, calls `search.run`; a command line it can't run goes to `FFS_RG` (a real ripgrep), unchanged |
 | `src/walk.zig` | Parallel recursive directory walk (worker pool over one queue), with ripgrep's filters: hidden, ignore files, `-g`, `--max-depth`; knows nothing about searching |
 | `src/glob.zig` | Globs and gitignore rule sets, for `-g` and ignore files |
-| `src/search.zig` | `run`: paths (directories, files, stdin), thread pool, walk; per-file work: open, read (streaming, or whole for context lines and `-v`), binary check, ripgrep's output modes |
+| `src/search.zig` | `run`: paths (directories, files, stdin), thread pool, walk; per-file work: open, read (streaming, or whole for context lines and `-v`), binary check, ripgrep's output modes, `--json` messages (`Printer.jsonLine`) and their stats |
 | `src/c_api.zig` | C ABI (`include/ffs.h`): `ffs_search` with a callback, over `search.run` |
 | `src/match.zig` | Finding the term in bytes (SIMD), with no I/O, or runs of a character class (`findLinesRun`); the byte-frequency table; naive reference and randomized tests |
 | `src/pcre.zig` | With `-Dpcre2=true`: PCRE2's JIT replaces the Pike VM where the DFA can't answer (`\b`, a DFA that gave up) and for `-o` |
 | `src/regex.zig` | Regex parser, compiler and Pike VM, behind the SIMD search as a prefilter (a literal, or a class run); `Vm.find` gives match positions for `-o` |
 | `src/dfa.zig` | Lazy DFA over the VM's program: `isMatch` for a line, `findLines` over a whole buffer; gives up on patterns that need too many states |
+| `src/types.zig` | ripgrep 15.2's file types (`rg --type-list`) as a table; `-t`/`-T` turn them into name rules for the walk |
 | `src/bench_match.zig` | Matcher microbenchmark (`bench/match.sh`, EXPERIMENTS.md, Experiment 8) |
 
 The layers connect through two small interfaces that are resolved at compile

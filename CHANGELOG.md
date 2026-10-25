@@ -2,6 +2,29 @@
 
 ## 0.0.10 — unreleased
 
+ffs can stand in for ripgrep under Claude Code's own search tools, which
+call rg with flags ffs didn't have.
+
+**Command line**
+
+- `--json`: ripgrep's JSON Lines messages (`begin`, `match`, `context`,
+  `end`, `summary`), field for field; only the timings differ. Text that
+  isn't UTF-8 comes base64-encoded, as ripgrep's `bytes`.
+- `-0`/`--null`: a NUL byte after each path instead of `:` or a newline.
+- `-M`/`--max-columns N`: lines longer than N bytes, newline included,
+  print as `[Omitted long matching line]`.
+- `-t`/`--type`, `-T`/`--type-not`, `--type-list`: ripgrep 15.2's file
+  types, with its rules (a named file is searched whatever its type, a
+  matching `-g` decides alone, a selected type brings back a hidden file).
+- `--iglob`: `-g` with ASCII letters matching either case.
+- `FFS_RG`: the path of a ripgrep binary that runs, unchanged, any command
+  line ffs can't (`-U`, `--sort`, `--follow`, `--type-add`, unknown flags).
+  Without it, an unknown flag is still an error, now naming the flag.
+- `tests/compat.sh` adds the command lines Claude Code's Grep tool builds:
+  `-l --null`, `-c -H --null` and `--json -n`, with `--hidden`, the VCS
+  directories left out and `--max-columns 500`; 124 checks in all. On the
+  Linux kernel those take 75–80 ms, against ripgrep's 102–106 ms.
+
 ## 0.0.9 — 2026-10-25
 
 Regexes with no fixed text, the one kind of search where ripgrep was

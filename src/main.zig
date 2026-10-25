@@ -3,6 +3,7 @@ const build_options = @import("build_options");
 const glob = @import("glob.zig");
 const regex = @import("regex.zig");
 const search = @import("search.zig");
+const types = @import("types.zig");
 const Regex = regex.Regex;
 
 // Usage: ffs [OPTIONS] PATTERN [PATH...]
@@ -20,6 +21,7 @@ const Regex = regex.Regex;
 //   search.zig  thread pool, per-file work: open, read, binary check, output
 //   match.zig   finding the term in bytes (SIMD), no I/O
 //   regex.zig   regex: parser, Pike VM, SIMD literal prefilter
+//   types.zig   ripgrep's file types, for -t and -T
 //
 // A pattern with no regex syntax in it skips the regex engine and goes
 // straight to the SIMD search, so `ffs PM_RESUME` costs what it did before
@@ -37,11 +39,33 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const args = try init.minimal.args.toSlice(arena);
 
-    var cli = Cli.parse(arena, args[1..]) catch |err| switch (err) {
+    var cli: Cli = .{};
+    cli.parse(arena, args[1..]) catch |err| switch (err) {
         error.OutOfMemory => return err,
-        else => usage(),
+        else => {
+            fallback(init, args);
+            std.debug.print("ffs: {s}: {s}\n", .{ switch (err) {
+                error.UnknownFlag => "unknown flag",
+                error.UnknownType => "unrecognized file type",
+                error.MissingValue => "missing value for",
+                error.UnexpectedValue => "no value expected for",
+                else => "bad value for",
+            }, cli.bad });
+            usage();
+        },
     };
 
+    if (cli.type_list) {
+        var buf: [4096]u8 = undefined;
+        var w = std.Io.File.stdout().writer(io, &buf);
+        for (types.table) |t| {
+            w.interface.print("{s}: ", .{t.name}) catch {};
+            for (t.globs, 0..) |g, k| w.interface.print("{s}{s}", .{ if (k > 0) ", " else "", g }) catch {};
+            w.interface.writeByte('\n') catch {};
+        }
+        w.interface.flush() catch {};
+        std.process.exit(0);
+    }
     if (cli.help) {
         std.debug.print(help, .{search.autoJobs()});
         std.process.exit(0);
@@ -71,8 +95,11 @@ pub fn main(init: std.process.Init) !void {
 
     var print = cli.print;
     print.file = .stdout();
+    // --json only changes how matching lines are printed; with -c, -l, -q
+    // or --files it does nothing, as in rg. It numbers lines unless -N.
+    print.json = cli.json and (print.mode == .lines or print.mode == .only_matching);
     // On a terminal rg numbers lines; in a pipe only with -n.
-    if (cli.line_number == null) cli.line_number = std.Io.File.stdout().isTty(io) catch false;
+    if (cli.line_number == null) cli.line_number = print.json or (std.Io.File.stdout().isTty(io) catch false);
     print.line_number = cli.line_number.?;
 
     const result = search.run(gpa, .{
@@ -86,6 +113,7 @@ pub fn main(init: std.process.Init) !void {
             .ignore_files = cli.ignore,
             .vcs_ignore = cli.vcs_ignore,
             .globs = if (cli.globs.rules.items.len > 0) &cli.globs else null,
+            .types = if (cli.types.rules.items.len > 0) &cli.types else null,
             .max_depth = cli.max_depth,
         },
         .invert = cli.invert,
@@ -102,6 +130,34 @@ pub fn main(init: std.process.Init) !void {
     std.process.exit(if (result.errors) 2 else if (result.matched) 0 else 1);
 }
 
+// A command line ffs can't run (multiline search, --sort, --follow, any flag
+// it doesn't know) goes to the ripgrep named by FFS_RG, if set, unchanged:
+// with FFS_RG, ffs can stand in for rg everywhere. FFS_FALLBACK is set for
+// that process so that an FFS_RG naming ffs itself fails instead of looping.
+// Returns only if there is no fallback, or it couldn't be started.
+fn fallback(init: std.process.Init, args: []const []const u8) void {
+    const env = init.environ_map;
+    const rg = env.get("FFS_RG") orelse return;
+    if (rg.len == 0 or env.get("FFS_FALLBACK") != null) return;
+    env.put("FFS_FALLBACK", "1") catch return;
+    const argv = init.arena.allocator().alloc([]const u8, args.len) catch return;
+    argv[0] = rg;
+    @memcpy(argv[1..], args[1..]);
+    const err = std.process.replace(init.io, .{ .argv = argv, .environ_map = env });
+    std.debug.print("ffs: can't run FFS_RG={s}: {t}\n", .{ rg, err });
+}
+
+// Adds the globs of file type `name` (or of every type, for "all") to `set`.
+fn addType(a: std.mem.Allocator, set: *glob.RuleSet, name: []const u8, kind: glob.Decision) !void {
+    var found = false;
+    for (types.table) |t| {
+        if (!std.mem.eql(u8, name, "all") and !std.mem.eql(u8, name, t.name)) continue;
+        found = true;
+        for (t.globs) |g| try set.add(a, g, kind);
+    }
+    if (!found) return error.UnknownType;
+}
+
 const Case = enum { sensitive, insensitive, smart };
 
 const Cli = struct {
@@ -116,6 +172,9 @@ const Cli = struct {
     print: search.Print = .{ .file = undefined },
     max_count: ?usize = null,
     globs: glob.RuleSet = .{},
+    types: glob.RuleSet = .{}, // -t and -T, in order
+    type_list: bool = false,
+    json: bool = false,
     hidden: bool = false,
     ignore: bool = true,
     vcs_ignore: bool = true,
@@ -124,15 +183,16 @@ const Cli = struct {
     jobs: usize = 0, // 0: automatic
     help: bool = false,
     version: bool = false,
+    bad: []const u8 = "", // after a parse error: the argument at fault
 
     // Flags may come anywhere, as in rg; `--` ends them. Short flags
     // combine (`-in`), and a value may be attached (`-A5`, `--glob=x`).
-    fn parse(a: std.mem.Allocator, args: []const []const u8) !Cli {
-        var c: Cli = .{};
+    fn parse(c: *Cli, a: std.mem.Allocator, args: []const []const u8) !void {
         var i: usize = 0;
         var only_positional = false;
         while (i < args.len) : (i += 1) {
             const arg = args[i];
+            c.bad = arg;
             if (only_positional or arg.len < 2 or arg[0] != '-') {
                 try c.positional.append(a, arg);
             } else if (std.mem.eql(u8, arg, "--")) {
@@ -168,7 +228,6 @@ const Cli = struct {
                 }
             }
         }
-        return c;
     }
 
     fn apply(c: *Cli, a: std.mem.Allocator, flag: Flag, value: ?[]const u8) !void {
@@ -198,13 +257,21 @@ const Cli = struct {
                 c.print.after = try number(v);
                 c.print.before = c.print.after;
             },
-            .glob => c.globs.add(a, v, .include) catch |err| switch (err) {
+            .glob, .iglob => (if (flag == .iglob) c.globs.addFold(a, v, .include) else c.globs.add(a, v, .include)) catch |err| switch (err) {
                 error.TooComplex => {
                     std.debug.print("ffs: glob too complex: {s}\n", .{v});
                     std.process.exit(2);
                 },
                 error.OutOfMemory => |e| return e,
             },
+            .type, .type_not => {
+                c.bad = v;
+                try addType(a, &c.types, v, if (flag == .type) .include else .ignore);
+            },
+            .type_list => c.type_list = true,
+            .json => c.json = true,
+            .nul => c.print.null_sep = true,
+            .max_columns => c.print.max_columns = try number(v),
             .hidden => c.hidden = true,
             .no_hidden => c.hidden = false,
             .no_ignore => c.ignore = false,
@@ -310,6 +377,13 @@ const Flag = enum {
     before_context,
     context,
     glob,
+    iglob,
+    type,
+    type_not,
+    type_list,
+    json,
+    nul,
+    max_columns,
     hidden,
     no_hidden,
     no_ignore,
@@ -327,7 +401,7 @@ const Flag = enum {
 
     fn takesValue(f: Flag) bool {
         return switch (f) {
-            .regexp, .max_count, .after_context, .before_context, .context, .glob, .max_depth, .threads, .color => true,
+            .regexp, .max_count, .after_context, .before_context, .context, .glob, .iglob, .type, .type_not, .max_columns, .max_depth, .threads, .color => true,
             else => false,
         };
     }
@@ -356,6 +430,10 @@ fn shortFlag(c: u8) ?Flag {
         'B' => .before_context,
         'C' => .context,
         'g' => .glob,
+        't' => .type,
+        'T' => .type_not,
+        '0' => .nul,
+        'M' => .max_columns,
         '.' => .hidden,
         'u' => .unrestricted,
         'a' => .text,
@@ -391,6 +469,13 @@ fn longFlag(name: []const u8) ?Flag {
         .{ "before-context", .before_context },
         .{ "context", .context },
         .{ "glob", .glob },
+        .{ "iglob", .iglob },
+        .{ "type", .type },
+        .{ "type-not", .type_not },
+        .{ "type-list", .type_list },
+        .{ "json", .json },
+        .{ "null", .nul },
+        .{ "max-columns", .max_columns },
         .{ "hidden", .hidden },
         .{ "no-hidden", .no_hidden },
         .{ "no-ignore", .no_ignore },
@@ -446,10 +531,18 @@ const help =
     \\  -A, --after-context N   N lines after each match
     \\  -B, --before-context N  N lines before each match
     \\  -C, --context N         N lines before and after each match
+    \\      --json              matching lines as ripgrep's JSON Lines messages
+    \\  -0, --null              a NUL byte after each path instead of ':' or '\\n'
+    \\  -M, --max-columns N     print lines longer than N bytes, newline included,
+    \\                          as "[Omitted long matching line]"
     \\
     \\Files:
     \\      --files             list the files that would be searched; no PATTERN
     \\  -g, --glob GLOB         search only files matching GLOB; !GLOB excludes
+    \\      --iglob GLOB        --glob, with ASCII letters matching either case
+    \\  -t, --type TYPE         search only files of TYPE (`--type-list`); "all": any type
+    \\  -T, --type-not TYPE     don't search files of TYPE
+    \\      --type-list         list the file types and their globs
     \\  -., --hidden            search hidden files and directories too
     \\      --no-hidden         skip hidden files and directories (the default)
     \\      --no-ignore         don't use .gitignore, .ignore or .rgignore files
@@ -463,6 +556,9 @@ const help =
     \\                          every logical CPU)
     \\  -h, --help
     \\  -V, --version
+    \\
+    \\With FFS_RG set to a ripgrep binary, command lines ffs can't run
+    \\(-U, --sort, --follow, other flags) are passed to it unchanged.
     \\
 ;
 
@@ -490,27 +586,43 @@ test "command line" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const c = try Cli.parse(a, &.{ "-nA5", "-g", "*.swift", "--glob=!build", "foo|bar", "Sources", "-i", "--", "-x" });
+    const c = try parsed(a, &.{ "-nA5", "-g", "*.swift", "--glob=!build", "foo|bar", "Sources", "-i", "--", "-x" });
     try std.testing.expect(c.line_number.?);
     try std.testing.expectEqual(5, c.print.after);
     try std.testing.expectEqual(2, c.globs.rules.items.len);
     try std.testing.expectEqual(.insensitive, c.case);
     try std.testing.expectEqual(3, c.positional.items.len);
     try std.testing.expectEqualStrings("-x", c.positional.items[2]);
-    try std.testing.expectError(error.UnknownFlag, Cli.parse(a, &.{"-Z"}));
-    try std.testing.expectError(error.MissingValue, Cli.parse(a, &.{"-A"}));
+    try std.testing.expectError(error.UnknownFlag, parsed(a, &.{"-Z"}));
+    try std.testing.expectError(error.MissingValue, parsed(a, &.{"-A"}));
 
-    var lit = try Cli.parse(a, &.{"PM_RESUME"});
+    var lit = try parsed(a, &.{"PM_RESUME"});
     try lit.patterns.append(a, "PM_RESUME");
     try std.testing.expect(!(try lit.pattern(a)).regex);
 
-    var multi = try Cli.parse(a, &.{ "-F", "-w", "-e", "a.b", "-e", "c" });
+    var multi = try parsed(a, &.{ "-F", "-w", "-e", "a.b", "-e", "c" });
     const t = try multi.pattern(a);
     try std.testing.expect(t.regex);
     try std.testing.expectEqualStrings("\\b(?:(?:a\\.b)|(?:c))\\b", t.source);
 
-    var smart = try Cli.parse(a, &.{ "-S", "-e", "\\Wfoo" });
+    var smart = try parsed(a, &.{ "-S", "-e", "\\Wfoo" });
     try std.testing.expect((try smart.pattern(a)).ignore_case);
-    var smart_upper = try Cli.parse(a, &.{ "-S", "-e", "Foo" });
+    var smart_upper = try parsed(a, &.{ "-S", "-e", "Foo" });
     try std.testing.expect(!(try smart_upper.pattern(a)).ignore_case);
+
+    // The flags Claude Code's Grep tool passes.
+    const g = try parsed(a, &.{ "--hidden", "--glob", "!.git", "--max-columns", "500", "--json", "-n", "-tc", "-T", "make", "--iglob", "*.MD", "--null", "foo" });
+    try std.testing.expectEqual(500, g.print.max_columns.?);
+    try std.testing.expect(g.json and g.print.null_sep);
+    try std.testing.expect(g.types.rules.items.len > 2);
+    try std.testing.expect(g.globs.rules.items[1].fold);
+    var bad: Cli = .{};
+    try std.testing.expectError(error.UnknownFlag, bad.parse(a, &.{ "-n", "--multiline", "foo" }));
+    try std.testing.expectEqualStrings("--multiline", bad.bad);
+}
+
+fn parsed(a: std.mem.Allocator, args: []const []const u8) !Cli {
+    var c: Cli = .{};
+    try c.parse(a, args);
+    return c;
 }

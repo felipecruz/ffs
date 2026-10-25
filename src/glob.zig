@@ -299,6 +299,9 @@ pub const Rule = struct {
     dir_only: bool,
     /// What a match means: leave the path out, or keep it.
     kind: Decision,
+    /// ASCII letters match either case (`--iglob`). Such rules are always
+    /// `.glob`-shaped.
+    fold: bool = false,
 };
 
 pub const Decision = enum { none, ignore, include };
@@ -327,10 +330,16 @@ pub const RuleSet = struct {
     /// was left out, see the top of this file.
     pub fn add(set: *RuleSet, a: Allocator, line: []const u8, kind_plain: Decision) Error!void {
         var budget: Budget = .forGlob();
-        return set.addBudgeted(a, line, kind_plain, &budget);
+        return set.addBudgeted(a, line, kind_plain, &budget, false);
     }
 
-    fn addBudgeted(set: *RuleSet, a: Allocator, line: []const u8, kind_plain: Decision, budget: *Budget) Error!void {
+    /// `add`, with ASCII letters matching either case (`--iglob`).
+    pub fn addFold(set: *RuleSet, a: Allocator, line: []const u8, kind_plain: Decision) Error!void {
+        var budget: Budget = .forGlob();
+        return set.addBudgeted(a, line, kind_plain, &budget, true);
+    }
+
+    fn addBudgeted(set: *RuleSet, a: Allocator, line: []const u8, kind_plain: Decision, budget: *Budget, fold: bool) Error!void {
         var pat = line;
         var kind = kind_plain;
         if (pat.len > 0 and pat[0] == '!') {
@@ -353,13 +362,13 @@ pub const RuleSet = struct {
             if (p.len > max_len and std.mem.indexOf(u8, p, "**") != null) return error.TooComplex;
         }
         for (expanded.items) |p| {
-            const shape = shapeOf(p, basename);
+            const shape: Shape = if (fold) .glob else shapeOf(p, basename);
             const lit = switch (shape) {
                 .glob, .literal => p,
                 .suffix => p[1..],
                 .prefix => p[0 .. p.len - 1],
             };
-            try set.rules.append(a, .{ .pattern = try a.dupe(u8, lit), .shape = shape, .basename = basename, .dir_only = dir_only, .kind = kind });
+            try set.rules.append(a, .{ .pattern = try a.dupe(u8, lit), .shape = shape, .basename = basename, .dir_only = dir_only, .kind = kind, .fold = fold });
         }
         if (kind == .include) set.any_include = true;
     }
@@ -377,7 +386,7 @@ pub const RuleSet = struct {
             if (line.len == 0 or line[0] == '#') continue;
             while (line.len > 0 and line[line.len - 1] == ' ' and !(line.len > 1 and line[line.len - 2] == '\\')) line = line[0 .. line.len - 1];
             budget.steps = Budget.forGlob().steps;
-            set.addBudgeted(a, line, .ignore, &budget) catch |err| switch (err) {
+            set.addBudgeted(a, line, .ignore, &budget, false) catch |err| switch (err) {
                 error.TooComplex => continue,
                 error.OutOfMemory => |e| return e,
             };
@@ -394,7 +403,7 @@ pub const RuleSet = struct {
             if (r.dir_only and !is_dir) continue;
             const text = if (r.basename) base else path;
             const hit = switch (r.shape) {
-                .glob => match(r.pattern, text, false),
+                .glob => match(r.pattern, text, r.fold),
                 .literal => std.mem.eql(u8, r.pattern, text),
                 .suffix => std.mem.endsWith(u8, text, r.pattern),
                 .prefix => std.mem.startsWith(u8, text, r.pattern),

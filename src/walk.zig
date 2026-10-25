@@ -60,6 +60,10 @@ pub const Filter = struct {
     /// (the root as given, without "./"), a '/', and the path from the root.
     globs: ?*const glob.RuleSet = null,
     glob_prefix: []const u8 = "",
+    /// `-t`/`-T` file types, as rules on the file name: a selected type
+    /// includes, a negated one ignores. With any selected, a file of no
+    /// selected type is left out. Directories are never filtered by type.
+    types: ?*const glob.RuleSet = null,
     /// Entries deeper than this are left out; the root's entries are at depth 1.
     max_depth: ?usize = null,
 };
@@ -244,21 +248,28 @@ fn Walker(comptime Visitor: type) type {
                 const is_dir = entry.kind == .directory;
                 if (sub.depth > max_depth or (is_dir and sub.depth == max_depth)) continue;
                 if (check_path) try setPath(w.gpa, &path, rel, entry.name);
-                // As in rg, the first that has a say decides: a glob, then
-                // the ignore files, then the hidden check. So a matching
-                // glob or a '!' line beats a leading dot.
+                // As in rg: a glob decides alone. Otherwise the ignore files,
+                // then the file types, can each leave the entry out; and an
+                // entry one of them includes (a '!' line, a selected type)
+                // skips the hidden check, so it beats a leading dot.
                 filter: {
                     if (w.filter.globs) |g| switch (g.decide(try w.globPath(&glob_path, path.items), is_dir)) {
                         .ignore => continue,
                         .include => break :filter,
                         .none => if (!is_dir and g.any_include) continue,
                     };
+                    var included = false;
                     if (sub.ign) |ign| switch (ignored(ign, path.items, is_dir)) {
                         .ignore => continue,
-                        .include => break :filter,
+                        .include => included = true,
                         .none => {},
                     };
-                    if (!w.filter.hidden and entry.name[0] == '.') continue;
+                    if (!is_dir) if (w.filter.types) |t| switch (t.decide(entry.name, false)) {
+                        .ignore => continue,
+                        .include => included = true,
+                        .none => if (t.any_include) continue,
+                    };
+                    if (!included and !w.filter.hidden and entry.name[0] == '.') continue;
                 }
                 switch (entry.kind) {
                     .directory => try w.pushDir(sub, rel, entry.name),

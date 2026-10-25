@@ -76,6 +76,15 @@ pub const Print = struct {
     with_filename: ?bool = null,
     before: usize = 0,
     after: usize = 0,
+    /// `--json`: matching (and context) lines as ripgrep's JSON Lines
+    /// messages, with `begin`/`end` around each file and a `summary` last.
+    /// Only for `.lines` and `.only_matching`, which then print whole lines.
+    json: bool = false,
+    /// `--null`: a NUL byte after each path instead of ':' (or '\n').
+    null_sep: bool = false,
+    /// `--max-columns`: lines longer than this, newline included, are
+    /// printed as "[Omitted long matching line]" (or "... context line").
+    max_columns: ?usize = null,
 
     pub const Mode = enum {
         lines,
@@ -92,7 +101,12 @@ pub const Print = struct {
     };
 
     fn context(p: Print) bool {
-        return p.mode == .lines and (p.before > 0 or p.after > 0);
+        return (p.mode == .lines or (p.json and p.mode == .only_matching)) and (p.before > 0 or p.after > 0);
+    }
+
+    // What ends a path: a NUL with `--null`, else `sep`.
+    fn afterPath(p: Print, sep: u8) u8 {
+        return if (p.null_sep) 0 else sep;
     }
 };
 
@@ -134,6 +148,7 @@ pub fn run(gpa: std.mem.Allocator, opts: Options, output: Output) !Result {
     };
     var searcher: Searcher = .{ .io = io, .gpa = gpa, .opts = opts, .output = output, .writer = &file_writer.interface };
     defer if (output == .print) file_writer.interface.flush() catch {};
+    const started: Io.Timestamp = .now(io, .awake);
 
     const cwd: []const []const u8 = &.{"."};
     const paths = if (opts.paths.len == 0) cwd else opts.paths;
@@ -181,7 +196,104 @@ pub fn run(gpa: std.mem.Allocator, opts: Options, output: Output) !Result {
         filter.glob_prefix = globPrefix(searcher.prefix);
         try walk.walk(io, gpa, dir, &searcher, opts.jobs, filter);
     }
+    if (output == .print and output.print.json) try searcher.stats.summary(searcher.writer, nanosSince(io, started));
     return .{ .matched = searcher.matched.load(.monotonic), .errors = searcher.errors };
+}
+
+fn nanosSince(io: Io, t: Io.Timestamp) u64 {
+    return @intCast(@max(0, t.untilNow(io, .awake).toNanoseconds()));
+}
+
+/// `--json` statistics, as in ripgrep's `end` and `summary` messages.
+const Stats = struct {
+    searches: std.atomic.Value(u64) = .init(0),
+    searches_with_match: std.atomic.Value(u64) = .init(0),
+    bytes_searched: std.atomic.Value(u64) = .init(0),
+    bytes_printed: std.atomic.Value(u64) = .init(0),
+    matched_lines: std.atomic.Value(u64) = .init(0),
+    matches: std.atomic.Value(u64) = .init(0),
+    elapsed: std.atomic.Value(u64) = .init(0), // nanoseconds, summed over files
+
+    fn add(st: *Stats, f: FileStats) void {
+        _ = st.searches.fetchAdd(1, .monotonic);
+        if (f.matched_lines > 0) _ = st.searches_with_match.fetchAdd(1, .monotonic);
+        _ = st.bytes_searched.fetchAdd(f.bytes_searched, .monotonic);
+        _ = st.bytes_printed.fetchAdd(f.bytes_printed, .monotonic);
+        _ = st.matched_lines.fetchAdd(f.matched_lines, .monotonic);
+        _ = st.matches.fetchAdd(f.matches, .monotonic);
+        _ = st.elapsed.fetchAdd(f.elapsed, .monotonic);
+    }
+
+    // ripgrep's last message; its keys come sorted.
+    fn summary(st: *Stats, out: *Io.Writer, total: u64) !void {
+        try out.writeAll("{\"data\":{\"elapsed_total\":");
+        try jsonDuration(out, total, true);
+        try out.print(",\"stats\":{{\"bytes_printed\":{d},\"bytes_searched\":{d},\"elapsed\":", .{ st.bytes_printed.load(.monotonic), st.bytes_searched.load(.monotonic) });
+        try jsonDuration(out, st.elapsed.load(.monotonic), true);
+        try out.print(",\"matched_lines\":{d},\"matches\":{d},\"searches\":{d},\"searches_with_match\":{d}}}}},\"type\":\"summary\"}}\n", .{
+            st.matched_lines.load(.monotonic), st.matches.load(.monotonic), st.searches.load(.monotonic), st.searches_with_match.load(.monotonic),
+        });
+    }
+};
+
+const FileStats = struct {
+    bytes_searched: u64 = 0,
+    bytes_printed: u64 = 0,
+    matched_lines: u64 = 0,
+    matches: u64 = 0,
+    elapsed: u64 = 0,
+};
+
+// A duration as ripgrep writes it: whole seconds, the nanoseconds left, and
+// seconds with 6 decimals. In `summary` the keys are sorted.
+fn jsonDuration(out: *Io.Writer, ns: u64, sorted: bool) !void {
+    const secs = ns / std.time.ns_per_s;
+    const nanos = ns % std.time.ns_per_s;
+    const human = @as(f64, @floatFromInt(ns)) / std.time.ns_per_s;
+    if (sorted) {
+        try out.print("{{\"human\":\"{d:.6}s\",\"nanos\":{d},\"secs\":{d}}}", .{ human, nanos, secs });
+    } else {
+        try out.print("{{\"secs\":{d},\"nanos\":{d},\"human\":\"{d:.6}s\"}}", .{ secs, nanos, human });
+    }
+}
+
+// Bytes as a JSON value, as ripgrep writes them: {"text":"..."} if they are
+// valid UTF-8, else {"bytes":"<base64>"}.
+fn jsonData(out: *Io.Writer, bytes: []const u8) !void {
+    if (std.unicode.utf8ValidateSlice(bytes)) {
+        try out.writeAll("{\"text\":");
+        try jsonString(out, bytes);
+        try out.writeByte('}');
+    } else {
+        try out.writeAll("{\"bytes\":\"");
+        try std.base64.standard.Encoder.encodeWriter(out, bytes);
+        try out.writeAll("\"}");
+    }
+}
+
+// A JSON string, escaped as serde_json (ripgrep) does: '"', '\\' and the
+// control characters, with the short forms where JSON has them.
+fn jsonString(out: *Io.Writer, str: []const u8) !void {
+    try out.writeByte('"');
+    var start: usize = 0;
+    for (str, 0..) |c, i| {
+        const esc: ?[]const u8 = switch (c) {
+            '"' => "\\\"",
+            '\\' => "\\\\",
+            '\n' => "\\n",
+            '\r' => "\\r",
+            '\t' => "\\t",
+            0x08 => "\\b",
+            0x0c => "\\f",
+            else => null,
+        };
+        if (esc == null and c >= 0x20) continue;
+        try out.writeAll(str[start..i]);
+        if (esc) |e| try out.writeAll(e) else try out.print("\\u{x:0>4}", .{c});
+        start = i + 1;
+    }
+    try out.writeAll(str[start..]);
+    try out.writeByte('"');
 }
 
 // The root as `-g` globs see it: "./a/" is "a", and "." is "".
@@ -227,6 +339,8 @@ pub const Searcher = struct {
     /// With context lines: something was printed, so the next file's first
     /// group needs a `--` before it. Guarded by `out_mutex`.
     printed_group: bool = false,
+    /// With `--json`.
+    stats: Stats = .{},
 
     pub const read_size = 256 * 1024;
 
@@ -236,12 +350,17 @@ pub const Searcher = struct {
         matches: Io.Writer.Allocating, // current file's output (`.print`) or line texts (`.callback`)
         hits: std.ArrayList(Collected) = .empty, // with `.callback` only
         vm: ?regex.Vm, // regex scratch space, with a regex only
+        /// The file offset of buf[0], and the bytes read so far, for `--json`.
+        offset: usize = 0,
+        read: usize = 0,
+        json_path: Io.Writer.Allocating, // the current file's path as JSON
     };
 
     pub fn initLocal(s: *Searcher) !Local {
         return .{
             .buf = try s.gpa.alloc(u8, read_size),
             .matches = .init(s.gpa),
+            .json_path = .init(s.gpa),
             .vm = if (s.opts.regex) |re| try regex.Vm.init(s.gpa, re) else null,
         };
     }
@@ -249,6 +368,7 @@ pub const Searcher = struct {
     pub fn deinitLocal(s: *Searcher, local: *Local) void {
         s.gpa.free(local.buf);
         local.matches.deinit();
+        local.json_path.deinit();
         local.hits.deinit(s.gpa);
         if (local.vm) |*vm| vm.deinit(s.gpa);
     }
@@ -259,7 +379,7 @@ pub const Searcher = struct {
         if (s.output == .print and s.output.print.mode == .files) {
             local.matches.clearRetainingCapacity();
             try name.write(&local.matches.writer);
-            try local.matches.writer.writeByte('\n');
+            try local.matches.writer.writeByte(s.output.print.afterPath('\n'));
             s.matched.store(true, .monotonic);
             return s.flush(local, name);
         }
@@ -285,7 +405,7 @@ pub const Searcher = struct {
         if (s.output == .print and s.output.print.mode == .files) {
             local.matches.clearRetainingCapacity();
             try name.write(&local.matches.writer);
-            try local.matches.writer.writeByte('\n');
+            try local.matches.writer.writeByte(s.output.print.afterPath('\n'));
             s.matched.store(true, .monotonic);
             return s.flush(local, name);
         }
@@ -293,10 +413,12 @@ pub const Searcher = struct {
         local.hits.clearRetainingCapacity();
         const complete = switch (s.output) {
             .print => |p| blk: {
-                var printer: Printer = .{ .s = s, .p = p, .out = &local.matches.writer, .vm = if (local.vm) |*vm| vm else null, .name = name, .with_filename = s.with_filename };
+                const started: ?Io.Timestamp = if (p.json) .now(s.io, .awake) else null;
+                var printer: Printer = .{ .s = s, .p = p, .out = &local.matches.writer, .local = local, .vm = if (local.vm) |*vm| vm else null, .name = name, .with_filename = s.with_filename };
                 const ok = try s.scan(local, file, p.context() or s.opts.invert, &printer);
-                if (ok) try printer.finish();
+                if (ok) try printer.finish(if (started) |t| nanosSince(s.io, t) else 0);
                 if (printer.count > 0) s.matched.store(true, .monotonic);
+                if (p.json) s.stats.add(if (ok) printer.file_stats else .{});
                 break :blk ok;
             },
             .callback => try s.scan(local, file, s.opts.invert, Collect{ .gpa = s.gpa, .local = local }),
@@ -313,7 +435,7 @@ pub const Searcher = struct {
         defer s.out_mutex.unlock(s.io);
         switch (s.output) {
             .print => |p| {
-                if (p.context()) {
+                if (p.context() and !p.json) {
                     if (s.printed_group) try s.writer.writeAll("--\n");
                     s.printed_group = true;
                 }
@@ -336,6 +458,8 @@ pub const Searcher = struct {
     // Standard input can return less before its end, so there that only
     // means another read.
     fn scan(s: *Searcher, local: *Local, file: Io.File, whole: bool, sink: anytype) !bool {
+        local.offset = 0;
+        local.read = 0;
         var line: usize = 1; // line number of local.buf[0]
         var carried: usize = 0; // partial line kept at the front of local.buf
         var first_read = true;
@@ -365,6 +489,7 @@ pub const Searcher = struct {
                 n -= bom.len;
             }
             first_read = false;
+            local.read += n;
             const fresh = local.buf[carried..][0..n];
             // Text files only: a NUL byte anywhere means binary.
             if (!s.opts.binary and std.mem.indexOfScalar(u8, fresh, 0) != null) return false;
@@ -385,6 +510,7 @@ pub const Searcher = struct {
             const rest = filled[cut..];
             std.mem.copyForwards(u8, local.buf[0..rest.len], rest);
             carried = rest.len;
+            local.offset += cut;
         }
     }
 
@@ -450,10 +576,14 @@ const Printer = struct {
     s: *Searcher,
     p: Print,
     out: *Io.Writer,
+    local: *Searcher.Local,
     vm: ?*regex.Vm,
     name: Name,
     with_filename: bool,
     count: usize = 0,
+    // The slice the current line is in: the chunk being searched, or with
+    // context lines the whole file.
+    chunk: []const u8 = "",
     // Context lines: `data` is the whole file; everything before `next_off`
     // has been printed or skipped.
     data: []const u8 = "",
@@ -461,9 +591,13 @@ const Printer = struct {
     next_line: usize = 1,
     after_left: usize = 0,
     printed: bool = false,
+    // `--json`: the `begin` message is out, and the numbers for `end`.
+    begun: bool = false,
+    file_stats: FileStats = .{},
 
     pub fn onLine(p: *Printer, m: match.Match) !void {
         p.count += 1;
+        p.chunk = m.data;
         switch (p.p.mode) {
             .quiet => {
                 p.s.stopped.store(true, .monotonic);
@@ -471,44 +605,119 @@ const Printer = struct {
             },
             .files_with_matches => {
                 try p.name.write(p.out);
-                try p.out.writeByte('\n');
+                try p.out.writeByte(p.p.afterPath('\n'));
                 return error.Done;
             },
             .count, .files => {},
-            .only_matching => if (!p.s.opts.invert) {
+            .only_matching => if (p.p.json) {
+                try p.wholeLine(m);
+            } else if (!p.s.opts.invert) {
                 const text = m.text();
                 var from: usize = 0;
                 while (p.s.findSpan(p.vm, text, from)) |span| {
-                    if (span.end > span.start) try p.line(':', m.line, text[span.start..span.end]);
+                    if (span.end > span.start) try p.line(':', m.line, text[span.start..span.end], false);
                     from = if (span.end > span.start) span.end else span.end + 1;
                     if (from > text.len) break;
                 }
             },
-            .lines => if (p.p.context()) try p.withContext(m) else try p.line(':', m.line, m.text()),
+            .lines => try p.wholeLine(m),
         }
         if (p.s.opts.max_count) |max| if (p.count >= max) return error.Done;
     }
 
-    fn finish(p: *Printer) !void {
+    fn wholeLine(p: *Printer, m: match.Match) !void {
+        if (p.p.context()) return p.withContext(m);
+        const text = m.text();
+        try p.line(':', m.line, text, (p.p.json or p.p.max_columns != null) and p.newlineAfter(text));
+    }
+
+    fn finish(p: *Printer, elapsed: u64) !void {
         if (p.p.context()) try p.afterContext(p.data.len);
         if (p.p.mode == .count and p.count > 0) {
             if (p.with_filename) {
                 try p.name.write(p.out);
-                try p.out.writeByte(':');
+                try p.out.writeByte(p.p.afterPath(':'));
             }
             try p.out.print("{d}\n", .{p.count});
         }
+        if (p.p.json) {
+            p.file_stats.bytes_searched = p.local.read;
+            p.file_stats.matched_lines = p.count;
+            p.file_stats.elapsed = elapsed;
+            if (p.begun) try p.jsonEnd();
+        }
     }
 
-    // One output line: [path<sep>][line<sep>]text.
-    fn line(p: *Printer, sep: u8, number: usize, text: []const u8) !void {
+    // Is `text`, a slice of the current chunk, followed by a newline there?
+    fn newlineAfter(p: *const Printer, text: []const u8) bool {
+        const end = @intFromPtr(text.ptr) + text.len - @intFromPtr(p.chunk.ptr);
+        return end < p.chunk.len and p.chunk[end] == '\n';
+    }
+
+    // One output line: [path<sep>][line<sep>]text. `nl`: a newline follows
+    // `text` in the file, which counts toward `--max-columns`.
+    fn line(p: *Printer, sep: u8, number: usize, text: []const u8, nl: bool) !void {
+        if (p.p.json) return p.jsonLine(sep == ':', number, text, nl);
         if (p.with_filename) {
             try p.name.write(p.out);
-            try p.out.writeByte(sep);
+            try p.out.writeByte(p.p.afterPath(sep));
         }
         if (p.p.line_number) try p.out.print("{d}{c}", .{ number, sep });
+        if (p.p.max_columns) |max| if (text.len + @intFromBool(nl) > max) {
+            try p.out.writeAll(if (sep == ':') "[Omitted long matching line]\n" else "[Omitted long context line]\n");
+            return;
+        };
         try p.out.writeAll(text);
         try p.out.writeByte('\n');
+    }
+
+    // A `match` or `context` message, after the file's `begin`.
+    fn jsonLine(p: *Printer, is_match: bool, number: usize, text: []const u8, nl: bool) !void {
+        if (!p.begun) {
+            p.begun = true;
+            const jp = &p.local.json_path;
+            jp.clearRetainingCapacity();
+            var name: std.ArrayList(u8) = .empty;
+            defer name.deinit(p.s.gpa);
+            try name.appendSlice(p.s.gpa, p.name.prefix);
+            if (p.name.slash) try name.append(p.s.gpa, '/');
+            try name.appendSlice(p.s.gpa, p.name.path);
+            try jsonData(&jp.writer, name.items);
+            const start = p.out.end;
+            try p.out.print("{{\"type\":\"begin\",\"data\":{{\"path\":{s}}}}}\n", .{jp.written()});
+            p.file_stats.bytes_printed += p.out.end - start;
+        }
+        const start = p.out.end;
+        try p.out.print("{{\"type\":\"{s}\",\"data\":{{\"path\":{s},\"lines\":", .{ if (is_match) "match" else "context", p.local.json_path.written() });
+        try jsonData(p.out, text.ptr[0 .. text.len + @intFromBool(nl)]);
+        if (p.p.line_number) try p.out.print(",\"line_number\":{d}", .{number}) else try p.out.writeAll(",\"line_number\":null");
+        const offset = p.local.offset + (@intFromPtr(text.ptr) - @intFromPtr(p.local.buf.ptr));
+        try p.out.print(",\"absolute_offset\":{d},\"submatches\":[", .{offset});
+        if (is_match and !p.s.opts.invert) {
+            var from: usize = 0;
+            var n: usize = 0;
+            while (p.s.findSpan(p.vm, text, from)) |span| {
+                if (n > 0) try p.out.writeByte(',');
+                n += 1;
+                try p.out.writeAll("{\"match\":");
+                try jsonData(p.out, text[span.start..span.end]);
+                try p.out.print(",\"start\":{d},\"end\":{d}}}", .{ span.start, span.end });
+                from = if (span.end > span.start) span.end else span.end + 1;
+                if (from > text.len) break;
+            }
+            p.file_stats.matches += n;
+        }
+        try p.out.writeAll("]}}\n");
+        p.file_stats.bytes_printed += p.out.end - start;
+    }
+
+    fn jsonEnd(p: *Printer) !void {
+        const f = p.file_stats;
+        try p.out.print("{{\"type\":\"end\",\"data\":{{\"path\":{s},\"binary_offset\":null,\"stats\":{{\"elapsed\":", .{p.local.json_path.written()});
+        try jsonDuration(p.out, f.elapsed, false);
+        try p.out.print(",\"searches\":1,\"searches_with_match\":{d},\"bytes_searched\":{d},\"bytes_printed\":{d},\"matched_lines\":{d},\"matches\":{d}}}}}}}\n", .{
+            @intFromBool(f.matched_lines > 0), f.bytes_searched, f.bytes_printed, f.matched_lines, f.matches,
+        });
     }
 
     fn withContext(p: *Printer, m: match.Match) !void {
@@ -524,12 +733,12 @@ const Printer = struct {
             b = if (std.mem.findScalarLast(u8, p.data[0 .. b - 1], '\n')) |nl| nl + 1 else 0;
             b_line -= 1;
         }
-        if (p.printed and b != p.next_off) try p.out.writeAll("--\n");
+        if (p.printed and b != p.next_off and !p.p.json) try p.out.writeAll("--\n");
         p.next_off = b;
         p.next_line = b_line;
         while (p.next_off < start) try p.contextLine();
 
-        try p.line(':', m.line, m.text());
+        try p.line(':', m.line, m.text(), m.end < p.data.len);
         p.next_off = m.end + 1;
         p.next_line = m.line + 1;
         p.after_left = p.p.after;
@@ -545,9 +754,10 @@ const Printer = struct {
     }
 
     fn contextLine(p: *Printer) !void {
-        const nl = std.mem.indexOfScalarPos(u8, p.data, p.next_off, '\n') orelse p.data.len;
-        try p.line('-', p.next_line, p.data[p.next_off..nl]);
-        p.next_off = nl + 1;
+        const nl = std.mem.indexOfScalarPos(u8, p.data, p.next_off, '\n');
+        const end = nl orelse p.data.len;
+        try p.line('-', p.next_line, p.data[p.next_off..end], nl != null);
+        p.next_off = end + 1;
         p.next_line += 1;
     }
 };
