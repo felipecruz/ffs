@@ -17,7 +17,11 @@
 //!     (?i) (?i:e)  ignore case for the rest of the group, or inside e
 //!
 //! The VM runs in O(line length × program size) time with no backtracking,
-//! so no pattern is catastrophically slow. Compiling is bounded too: groups
+//! so no pattern is catastrophically slow. Most of the time it doesn't run:
+//! a lazy DFA built from the same program (dfa.zig) answers `isMatch` in
+//! one table lookup per byte, and searches whole buffers for regexes with
+//! no literal; the VM is left for `\b`, for `find`, and for patterns the
+//! DFA gives up on. Compiling is bounded too: groups
 //! and repetitions nest at most `max_depth` deep, as in ripgrep, and the
 //! program has at most `max_prog` instructions. `Vm.isMatch` answers whether a
 //! line matches; `Vm.find` also says where (leftmost-first, as in ripgrep),
@@ -31,6 +35,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const match = @import("match.zig");
 const pcre = @import("pcre.zig");
+const Dfa = @import("dfa.zig").Dfa;
 
 pub const Error = error{
     OutOfMemory,
@@ -51,7 +56,7 @@ const max_prog = 10_000;
 /// the compiler and the literal analysis recurse once per level.
 const max_depth = 250;
 
-const Set = std.bit_set.Integer(256);
+pub const Set = std.bit_set.Integer(256);
 
 const Node = union(enum) {
     set: Set, // one byte from the set
@@ -65,7 +70,7 @@ const Node = union(enum) {
 
 const Repeat = struct { node: *const Node, min: u32, max: ?u32, greedy: bool = true }; // null: unbounded
 
-const Inst = union(enum) {
+pub const Inst = union(enum) {
     set: Set, // consume one byte from the set
     split: [2]u32, // try both, first one preferred
     jmp: u32,
@@ -83,6 +88,10 @@ pub const Regex = struct {
     literals: []const []const u8,
     /// The regex matches exactly the lines containing one of `literals`.
     exact: bool,
+    /// With no literal: a run of `min` bytes from `ranges` that every match
+    /// contains, if one is rare enough to prefilter with (`[0-9a-f]{16}`).
+    /// `exact`: the regex matches exactly the lines that have the run.
+    run: ?Run = null,
     ignore_case: bool,
     /// Bytes that can start a match, or null if a match can start with an
     /// assertion or be empty. Lets the VM skip bytes while no thread is alive.
@@ -115,6 +124,7 @@ pub const Regex = struct {
         _ = try c.emit(.match);
         const literals = try required(a, root, ignore_case) orelse &.{};
         const first = try firstBytes(a, c.prog.items);
+        const run = if (literals.len == 0) usableRun(root) else null;
 
         // Copy the arena last: allocations after the copy would be lost.
         const pcre_pattern = if (pcre.enabled) blk: {
@@ -127,6 +137,7 @@ pub const Regex = struct {
             .prog = c.prog.items,
             .literals = literals,
             .exact = literals.len > 0 and onlyLiterals(root, ignore_case),
+            .run = run,
             .ignore_case = ignore_case,
             .first = first,
         };
@@ -144,6 +155,16 @@ pub fn findLines(re: *const Regex, vm: *Vm, data: []const u8, first_line: usize,
     if (re.exact) return prefilter(re, data, first_line, sink);
     const filter: Filter(@TypeOf(sink)) = .{ .re = re, .vm = vm, .sink = sink };
     if (re.literals.len == 0) {
+        if (re.run) |r| {
+            if (r.exact) return match.findLinesRun(data, r.ranges, r.min, first_line, sink);
+            return match.findLinesRun(data, r.ranges, r.min, first_line, filter);
+        }
+        if (vm.dfa) |*d| if (!d.failed) {
+            return d.findLines(data, first_line, sink) catch |err| switch (err) {
+                error.GaveUp => everyLine(data, d.resume_pos, d.resume_line, filter),
+                else => |e| e,
+            };
+        };
         if (pcre.enabled) if (re.pcre != null) return pcreLines(re, vm, data, first_line, filter);
         return everyLine(data, 0, first_line, filter);
     }
@@ -500,8 +521,9 @@ fn treeDepth(a: Allocator, root: *const Node) Error!usize {
 // Literals every match contains one of, for the SIMD prefilter; null if
 // there are none. A run of single bytes in a concatenation is one literal
 // (anchors don't break a run); an alternation is the union of its
-// branches' literals. Of the candidates in a concatenation, the set whose
-// shortest literal is longest wins, then the smaller set.
+// branches' literals. Of the candidates in a concatenation, the set that
+// should occur least often in source code wins (`score`), then the
+// smaller set.
 fn required(a: Allocator, n: Node, fold: bool) Error!?[]const []const u8 {
     switch (n) {
         .set => |s| return if (literalByte(s, fold)) |b| try one(a, &.{b}) else null,
@@ -532,11 +554,11 @@ fn required(a: Allocator, n: Node, fold: bool) Error!?[]const []const u8 {
                     .bol, .eol, .word_boundary => continue,
                     else => {},
                 }
-                if (run.items.len > 0) best = better(best, try one(a, run.items));
+                if (run.items.len > 0) best = better(best, try one(a, run.items), fold);
                 run = .empty;
-                best = better(best, try required(a, item, fold));
+                best = better(best, try required(a, item, fold), fold);
             }
-            if (run.items.len > 0) best = better(best, try one(a, run.items));
+            if (run.items.len > 0) best = better(best, try one(a, run.items), fold);
             return best;
         },
     }
@@ -548,19 +570,130 @@ fn one(a: Allocator, lit: []const u8) Error![]const []const u8 {
     return out;
 }
 
-fn better(x: ?[]const []const u8, y: ?[]const []const u8) ?[]const []const u8 {
+fn better(x: ?[]const []const u8, y: ?[]const []const u8, fold: bool) ?[]const []const u8 {
     const xs = x orelse return y;
     const ys = y orelse return x;
-    const x_min = shortest(xs);
-    const y_min = shortest(ys);
-    if (y_min != x_min) return if (y_min > x_min) y else x;
+    const x_bits = score(xs, fold);
+    const y_bits = score(ys, fold);
+    if (y_bits != x_bits) return if (y_bits > x_bits) y else x;
     return if (ys.len < xs.len) y else x;
 }
 
-fn shortest(lits: []const []const u8) usize {
-    var min: usize = std.math.maxInt(usize);
-    for (lits) |l| min = @min(min, l.len);
-    return min;
+// How rare a line position starting one of `lits` is, in bits (-log2 of
+// its estimated frequency), taking a literal's bytes as independent, with
+// the frequencies in `match.rarity`. "class " is 30 bits, "_" alone 5,
+// {"spin", "mutex"} 22: about as rare as "spin" alone.
+// `rareness`, less 4 bits for each literal after the first: the SIMD search
+// for two literals takes ~40% longer than for one, which only pays if they
+// are much rarer. "dict" (21 bits) beats {"Find", "Delete"} (24).
+fn score(lits: []const []const u8, fold: bool) f64 {
+    return rareness(lits, fold) - 4 * @as(f64, @floatFromInt(lits.len - 1));
+}
+
+fn rareness(lits: []const []const u8, fold: bool) f64 {
+    var p: f64 = 0;
+    for (lits) |lit| {
+        var bits: f64 = 0;
+        for (lit) |c| bits += @as(f64, @floatFromInt(match.byteRarity(c, fold))) / 4;
+        p += std.math.exp2(-bits);
+    }
+    return -std.math.log2(p);
+}
+
+pub const Run = struct { ranges: match.Ranges, min: usize, exact: bool };
+
+// A class run worth prefiltering with: one `match.findLinesRun` can test
+// (few ranges), and rare enough that the SIMD scan rejects most lines
+// (`min_run_bits`). `\w{3}` is not: most lines have one.
+fn usableRun(root: Node) ?Run {
+    const r = classRun(root) orelse return null;
+    if (runBits(r) < min_run_bits) return null;
+    const ranges = match.Ranges.of(r.set) orelse return null;
+    return .{ .ranges = ranges, .min = r.min, .exact = r.exact };
+}
+
+// About one position in 256 or fewer starts a run.
+const min_run_bits = 8;
+
+const ClassRun = struct { set: Set, min: usize, exact: bool };
+
+// A run of at least `min` consecutive bytes from `set` that every match of
+// `n` contains: a repeated set, or consecutive ones in a concatenation when
+// each set contains the last or is contained in it (the run is then from
+// the larger). `exact`: `n` is the run and nothing else, so a line matches
+// exactly when it has the run. '\n' is never in the set: a run is in a line.
+fn classRun(n: Node) ?ClassRun {
+    switch (n) {
+        .set, .repeat => {
+            if (simpleRun(n)) |r| return withoutNewline(r);
+            if (n == .set or n.repeat.min == 0) return null;
+            var inner = classRun(n.repeat.node.*) orelse return null;
+            inner.exact = false;
+            return inner;
+        },
+        .concat => |items| {
+            var best: ?ClassRun = null;
+            var cur: ?ClassRun = null;
+            for (items) |item| {
+                if (simpleRun(item)) |nx| {
+                    if (cur) |*c| {
+                        if (nx.set.subsetOf(c.set) or c.set.subsetOf(nx.set)) {
+                            c.set.setUnion(nx.set);
+                            c.min += nx.min;
+                            continue;
+                        }
+                        best = betterRun(best, c.*);
+                    }
+                    cur = nx;
+                    continue;
+                }
+                if (cur) |c| best = betterRun(best, c);
+                cur = null;
+                if (classRun(item)) |r| best = betterRun(best, r);
+            }
+            if (cur) |c| best = betterRun(best, c);
+            var r = withoutNewline(best) orelse return null;
+            // Exact: every item is the same set, alone or repeated.
+            r.exact = items.len > 0 and for (items) |item| {
+                const x = simpleRun(item) orelse break false;
+                if (!x.set.eql(simpleRun(items[0]).?.set)) break false;
+            } else true;
+            return r;
+        },
+        else => return null,
+    }
+}
+
+// A set, or a set repeated at least once.
+fn simpleRun(n: Node) ?ClassRun {
+    return switch (n) {
+        .set => |s| .{ .set = s, .min = 1, .exact = true },
+        .repeat => |r| if (r.min > 0 and r.node.* == .set) .{ .set = r.node.set, .min = r.min, .exact = true } else null,
+        else => null,
+    };
+}
+
+fn withoutNewline(r: ?ClassRun) ?ClassRun {
+    var x = r orelse return null;
+    x.set.unset('\n');
+    if (x.set.count() == 0) return null;
+    return x;
+}
+
+fn betterRun(x: ?ClassRun, y: ClassRun) ClassRun {
+    const xr = x orelse return y;
+    return if (runBits(y) > runBits(xr)) y else xr;
+}
+
+// How rare a run is: -log2 of the chance that `min` given bytes are all in
+// the set, with byte frequencies from `match.rarity`.
+fn runBits(r: ClassRun) f64 {
+    var p: f64 = 0;
+    for (0..256) |b| {
+        if (b != '\n' and r.set.isSet(b)) p += std.math.exp2(-@as(f64, @floatFromInt(match.rarity[b])) / 4);
+    }
+    if (p <= 0) return std.math.inf(f64);
+    return -std.math.log2(@min(1.0, p)) * @as(f64, @floatFromInt(r.min));
 }
 
 // Is the regex nothing but literal strings, alone or as alternatives? Then a
@@ -694,12 +827,14 @@ pub const Vm = struct {
     stack: []u32, // pcs to follow in `add`
     gen: usize = 0,
     pcre: if (pcre.enabled) ?pcre.Matcher else void = if (pcre.enabled) null else {},
+    dfa: ?Dfa = null, // null for a pattern with `\b`
 
     pub fn init(gpa: Allocator, re: *const Regex) !Vm {
         const n = re.prog.len;
         const seen = try gpa.alloc(usize, n);
         @memset(seen, 0);
         return .{
+            .dfa = try Dfa.init(gpa, re.prog),
             .pcre = if (pcre.enabled) (if (re.pcre) |p| try pcre.Matcher.init(p) else null) else {},
             .clist = try gpa.alloc(u32, n),
             .nlist = try gpa.alloc(u32, n),
@@ -712,6 +847,7 @@ pub const Vm = struct {
 
     pub fn deinit(vm: *Vm, gpa: Allocator) void {
         if (pcre.enabled) if (vm.pcre) |m| m.deinit();
+        if (vm.dfa) |*d| d.deinit();
         gpa.free(vm.clist);
         gpa.free(vm.nlist);
         gpa.free(vm.cstart);
@@ -720,14 +856,21 @@ pub const Vm = struct {
         gpa.free(vm.stack);
     }
 
-    /// Does `line` contain a match? Runs all threads in lockstep, one byte
-    /// at a time, starting a new thread at every position (skipping ahead
-    /// with `first` while none is alive).
+    /// Does `line` contain a match? The DFA answers if it can, then PCRE2,
+    /// then the Pike VM.
     pub fn isMatch(vm: *Vm, re: *const Regex, line: []const u8) bool {
+        if (vm.dfa) |*d| if (d.isMatch(line)) |m| return m;
         if (pcre.enabled) if (re.pcre) |p| {
             // On an error (a PCRE2 limit) the VM answers instead.
             if (vm.pcre.?.find(p, line, 0)) |m| return m != null else |_| {}
         };
+        return vm.pike(re, line);
+    }
+
+    // `isMatch` on the Pike VM: runs all threads in lockstep, one byte at a
+    // time, starting a new thread at every position (skipping ahead with
+    // `first` while none is alive).
+    fn pike(vm: *Vm, re: *const Regex, line: []const u8) bool {
         var n_cur: usize = 0;
         vm.gen += 1;
         var i: usize = 0;
@@ -1117,6 +1260,9 @@ test "regex required literal" {
         .{ "[0-9a-f]{8}", false, "" },
         .{ "Hello", true, "hello" },
         .{ "[Hh]ello", false, "ello" },
+        // Rarer beats longer: 'K' and 'j' are rare in source, 'e' common.
+        .{ "eee[0-9]Kj", false, "Kj" },
+        .{ "class \\w+ : public", false, " : public" },
     };
     for (cases) |c| {
         var re = try Regex.compile(testing.allocator, c[0], c[1]);
@@ -1125,6 +1271,26 @@ test "regex required literal" {
         defer testing.allocator.free(joined);
         try testing.expectEqualStrings(c[2], joined);
     }
+    // No literal: a class run, when rare enough.
+    for ([_]struct { []const u8, ?usize, bool }{
+        .{ "[0-9a-f]{16}", 16, true },
+        .{ "[A-Za-z_]{30,}", 30, true },
+        .{ "\\d{5,}", 5, true },
+        .{ "[0-9][0-9]{3}", 4, true },
+        .{ "[0-9][0-9a-f]{15}", 16, false }, // from the larger set, not exact
+        .{ "^[0-9]{8}", 8, false },
+        .{ "x?[0-9]{8}", 8, false },
+        .{ "([0-9]{8})+", 8, false },
+        .{ "\\w{3}", null, false }, // too common to pay
+        .{ "[0-9]{8}|[a-f]{9}", null, false }, // alternation: not analysed
+        .{ ".{40}", null, false }, // every byte but '\n': too common
+    }) |c| {
+        var re = try Regex.compile(testing.allocator, c[0], false);
+        defer re.deinit();
+        try testing.expectEqual(c[1], if (re.run) |r| r.min else null);
+        if (re.run) |r| try testing.expectEqual(c[2], r.exact);
+    }
+
     // Only literals: the prefilter's answer is the answer.
     for ([_]struct { []const u8, bool }{
         .{ "foo", true },         .{ "foo|bar baz", true }, .{ "(foo|bar)", true },
@@ -1236,6 +1402,7 @@ test "regex VM matches backtracking reference" {
     var prng: std.Random.DefaultPrng = .init(0x7e9e);
     const rand = prng.random();
     var line_buf: [16]u8 = undefined;
+    var runs: usize = 0; // lines checked against a class run
 
     for (0..5_000) |_| {
         _ = arena.reset(.retain_capacity);
@@ -1258,8 +1425,9 @@ test "regex VM matches backtracking reference" {
             for (0..line.len + 1) |i| {
                 if (try backtrack(a, &.{root}, line, i)) expected = true;
             }
-            if (vm.isMatch(&re, line) != expected) {
-                std.debug.print("pattern {s} (ignore case {}) line \"{s}\": expected {}\n", .{ pattern.items, ignore_case, line, expected });
+            const dfa_says: ?bool = if (vm.dfa) |*d| d.isMatch(line) else null;
+            if (vm.pike(&re, line) != expected or (dfa_says != null and dfa_says.? != expected)) {
+                std.debug.print("pattern {s} (ignore case {}) line \"{s}\": expected {}, dfa {?}\n", .{ pattern.items, ignore_case, line, expected, dfa_says });
                 return error.TestUnexpectedResult;
             }
             // find: the leftmost start, and the end a backtracker picks there.
@@ -1285,8 +1453,82 @@ test "regex VM matches backtracking reference" {
                 if (expected) try testing.expect(found);
                 if (re.exact) try testing.expectEqual(expected, found);
             }
+            if (re.run) |r| {
+                var run: usize = 0;
+                const has = for (line) |c| {
+                    run = if (r.ranges.contains(c)) run + 1 else 0;
+                    if (run >= r.min) break true;
+                } else false;
+                if (expected) try testing.expect(has);
+                if (r.exact) try testing.expectEqual(expected, has);
+                runs += 1;
+            }
         }
     }
+    try testing.expect(runs > 0);
+}
+
+test "DFA findLines over a buffer matches line-by-line answers" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var prng: std.Random.DefaultPrng = .init(0xdfa);
+    const rand = prng.random();
+    var data_buf: [96]u8 = undefined;
+    var checked: usize = 0;
+    for (0..3_000) |_| {
+        _ = arena.reset(.retain_capacity);
+        const a = arena.allocator();
+        var pattern: std.ArrayList(u8) = .empty;
+        try randomPattern(rand, &pattern, a, 0);
+        var re = try Regex.compile(testing.allocator, pattern.items, rand.boolean());
+        defer re.deinit();
+        var vm = try Vm.init(testing.allocator, &re);
+        defer vm.deinit(testing.allocator);
+        const d = if (vm.dfa) |*d| d else continue; // `\b`
+        for (0..10) |_| {
+            // Short lines, empty ones included, with or without a final '\n'.
+            const data = data_buf[0..rand.uintAtMost(usize, data_buf.len)];
+            for (data) |*c| c.* = "abAB_ \n\n"[rand.uintLessThan(usize, 8)];
+            var want: std.ArrayList(usize) = .empty;
+            var it = std.mem.splitScalar(u8, data, '\n');
+            var ln: usize = 1;
+            var off: usize = 0;
+            while (it.next()) |line| : (ln += 1) {
+                if (off == data.len and data.len > 0) break; // nothing after a final '\n'
+                if (data.len == 0) break;
+                if (vm.pike(&re, line)) try want.append(a, ln);
+                off += line.len + 1;
+            }
+            var got: std.ArrayList(usize) = .empty;
+            const after = try d.findLines(data, 1, CollectLines{ .gpa = a, .lines = &got });
+            if (!std.mem.eql(usize, want.items, got.items)) {
+                std.debug.print("pattern {s} data \"{f}\": want {any} got {any}\n", .{ pattern.items, std.zig.fmtString(data), want.items, got.items });
+                return error.TestUnexpectedResult;
+            }
+            try testing.expectEqual(1 + std.mem.countScalar(u8, data, '\n'), after);
+            checked += 1;
+        }
+    }
+    try testing.expect(checked > 10_000);
+}
+
+test "DFA gives up on a pattern that needs too many states" {
+    // Every combination of where the 'a'-runs started is a state.
+    var re = try Regex.compile(testing.allocator, "a[ab]{14}c", false);
+    defer re.deinit();
+    var vm = try Vm.init(testing.allocator, &re);
+    defer vm.deinit(testing.allocator);
+    var prng: std.Random.DefaultPrng = .init(1);
+    var line: [4096]u8 = undefined;
+    var answers: usize = 0;
+    for (0..400) |_| {
+        for (&line) |*c| c.* = "ab"[prng.random().uintLessThan(usize, 2)];
+        line[line.len - 1] = 'c';
+        // Whatever answers, the answer is right.
+        try testing.expectEqual(vm.pike(&re, &line), vm.isMatch(&re, &line));
+        answers += 1;
+    }
+    try testing.expect(vm.dfa.?.failed or vm.dfa.?.clears > 0);
 }
 
 const CollectLines = struct {

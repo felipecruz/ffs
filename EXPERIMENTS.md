@@ -8,7 +8,7 @@ code works see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 Environment: macOS 27.0.1, Apple M5, Homebrew.
 
-> **Experiments 1–14 and 16 run on macOS; Experiment 15 runs on Linux.**
+> **Experiments 1–14 and 16 run on macOS; Experiments 15 and 17 run on Linux.**
 > "Linux" in the tables below always means the *Linux kernel source tree*
 > used as a fixture (`fixtures/linux`), not the Linux operating system.
 > Conclusions about threads and system time in Experiments 1–14 and 16 are
@@ -38,6 +38,14 @@ git clone --depth 1 --branch 8.0.2 https://github.com/redis/redis.git fixtures/r
 
 - Commit: `994bc96bb1744cb153392fc96bdba43eae56e17f`
 - ~1,680 tracked files (mostly C, plus Tcl and Lua), ~25 MB on disk including `.git`
+
+Experiment 17 adds the [LLVM monorepo](https://github.com/llvm/llvm-project),
+shallow clone of `main` at `cced08fcc92db61044c0e32ef35444fa48246345`
+(2026-10-25): 188,582 files, 3.1 GB including `.git`.
+
+```sh
+git clone --depth 1 https://github.com/llvm/llvm-project.git fixtures/llvm
+```
 
 ## Experiment 1 — literal search, count matches
 
@@ -1363,6 +1371,176 @@ regex loss. The no-literal patterns are still 1.25–2x behind ripgrep.
 - `README.md`'s macOS column (0.84–0.87 s literal, 2.30 s hex) still holds
   within this noise, so it was left alone.
 
+## Experiment 17 — LLVM: rare probes, a lazy DFA and class runs
+
+A new fixture, the LLVM monorepo (Setup), on the Linux box of Experiment
+15 (same ripgrep 15.2.0 and hyperfine 1.20.0). LLVM is mostly C++ with
+long template-heavy lines and large test directories of `.ll`, `.td` and
+`.mlir` files. `bench/llvm.sh` runs 21 searches with ffs and ripgrep:
+literals, `-i`, the default ignore-file filtering, `-g`, `-l`, `-c`, `-w`,
+regexes with a literal, alternations, and three with no literal. It checks
+that both tools report the same number of lines (they do, for all 21, in
+every run below). Following the convention that serious regex numbers use
+the PCRE2 build, the build compared is `-Dpcre2=true`; the default build is
+checked too.
+
+### Where ffs lost
+
+On the first run (`results-linux/llvm-pcre2-base/`), ffs won 18 of 21, by
+1.2–1.9x. It lost three:
+
+| Search (`-uu -n`) | ffs + PCRE2 | ripgrep | |
+|:---|---:|---:|:---|
+| `[A-Za-z_]{30,}` | 1,038 ms | **479 ms** | 2.2x slower |
+| `[0-9a-f]{16}` | 589 ms | **453 ms** | 1.3x slower |
+| `class \w+ : public \w+` | 210 ms | **178 ms** | 1.2x slower |
+
+The default build lost the first two by 11x and 6x (its user time reached
+77 s on `{30,}`; `results-linux/llvm-vm-base/`).
+
+Two causes. **(1)** `class \w+ : public \w+` has a literal, `" : public "`,
+and the SIMD search compares a term's first and last byte, here two
+spaces: nearly every indented line was a candidate. `-F ' : public '` took
+187 ms, `-F ': public'` 120 ms. **(2)** With no literal, every byte went to
+PCRE2 (or the Pike VM). Inside a long identifier, a backtracker can match
+29 bytes of `[A-Za-z_]{30,}`, fail, and start again one byte later, so its
+work grows with the repeat count; the Pike VM keeps up to 30 threads alive
+per byte. On the default build `{10,}` took 3.3 s, `{20,}` 4.8 s; ripgrep's
+DFA reads each byte once.
+
+### What changed, one step at a time
+
+Each step was timed against the baseline binary built from `7256ab4`,
+both PCRE2 builds, 10–15 runs, warm cache.
+
+1. **Rare probes** (`match.probes`). A byte-frequency table (`match.rarity`,
+   -4·log2 of each byte's frequency in a 470 MB sample of the three
+   fixtures) picks the term's two rarest bytes as the SIMD probes, here
+   `:` and `b`. `class \w+ : public \w+`: 195 → **126 ms** (user 1,488 →
+   639 ms). The first version cost 8% on `-i -F DenseMap` and 4% on a
+   three-literal alternation, even where the probes stayed at the ends.
+   Two reasons: `probes` ran once per buffer (188,000 times) and did float
+   `exp2`/`log2` per letter under `-i`; and runtime offsets meant the
+   newline-counting load could no longer double as the first probe.
+   A comptime table for the folded case and a comptime copy of the loop
+   for end probes fixed the first (115.1 ms before, 116.6 after). For the second, the
+   rare pair is used only when the ends are common (more than 1 position in
+   1,024) and the rare pair is at least 4x better: the alternation's end
+   pairs (`i`/`>`, `d`/`>`) were already rare, so the swap bought nothing
+   and cost a load. After that, user time was level with the baseline on
+   every other query.
+2. **Choosing the literal by rarity** (`regex.score`). Of the literals a
+   regex requires, the one estimated rarest wins (byte rarities summed),
+   not the longest. A set of several literals pays 4 bits per extra
+   literal: on LLVM, `-e 'Find|Delete'` took 839 ms of user time against
+   609 ms for `-F dict`, so `dict` stays the choice for
+   `dict(Find|Delete)\(` even though `{Find, Delete}` is estimated 2 bits
+   rarer. This changed no choice in the suite; it is a correctness-of-
+   heuristic fix (`eee[0-9]Kj` now prefilters with `Kj`).
+3. **Lazy DFA** (`src/dfa.zig`, ARCHITECTURE.md). One table lookup per
+   byte, states built on demand from the Pike VM's program, a 2 MB cache
+   per thread, and a fallback to the VM/PCRE2 if the cache thrashes. It
+   answers `isMatch` for prefiltered lines and scans whole buffers when
+   there is no literal. Not for `\b`.
+
+   | `-uu -n` | before | DFA | ripgrep |
+   |:---|---:|---:|---:|
+   | `[0-9a-f]{16}` | 580 ms | **366 ms** | 442 ms |
+   | `[A-Za-z_]{30,}` | 1,029 ms | **369 ms** | 476 ms |
+   | `[0-9]{5,}` | 437 ms | **378 ms** | 608 ms |
+
+   For lines the literal prefilter hands over, the DFA and PCRE2 are
+   equally fast: with PCRE2 asked first instead, seven regex queries moved
+   by -2 to +2 ms. Checking the candidates is not where the time goes. The
+   DFA stays first, so the default build gets the same speed.
+4. **Class-run prefilter** (`match.findLinesRun`). With no literal, a run
+   of at least `min` bytes from one class that every match contains (16
+   from `[0-9a-f]`), when the class has at most 4 ranges and the run is
+   rare (8 bits or more). The SIMD scan marks the class's bytes per block
+   and finds runs by AND-ing the bitmask with itself shifted. When the
+   regex is just the run, its lines are the answer; otherwise the DFA
+   checks them.
+
+   | `-uu -n` | DFA | **+ class runs** | ripgrep |
+   |:---|---:|---:|---:|
+   | `[0-9a-f]{16}` | 366 ms | **156 ms** | 443 ms |
+   | `[A-Za-z_]{30,}` | 369 ms | **154 ms** | 477 ms |
+   | `[0-9]{5,}` | 378 ms | **169 ms** | 613 ms |
+5. **PCRE2.** Restarting PCRE2 past a failed run, the other idea, became
+   moot: the class-run scan and the DFA take those patterns before PCRE2
+   sees them. Its start-of-match optimizations were already on
+   (`pcre.zig` never passes `PCRE2_NO_START_OPTIMIZE`). PCRE2 is now used
+   for `\b` patterns, a DFA that gave up, and `-o`.
+
+### The suite after
+
+`results-linux/llvm-pcre2/`, PCRE2 build, against the first run. Rows 6–9
+use each tool's defaults (ignore files on); the rest `-uu -n`.
+
+| Search | ffs before | **ffs after** | ripgrep | |
+|:---|---:|---:|---:|:---|
+| `-F ZQXJVKWQZ_NOPE` | 122 ms | **121 ms** | 167 ms | 1.38x faster |
+| `-F getOperandBundle` | 123 ms | **121 ms** | 167 ms | 1.38x faster |
+| `-F getOperand` | 124 ms | **123 ms** | 171 ms | 1.39x faster |
+| `-F return` | 134 ms | **133 ms** | 253 ms | 1.90x faster |
+| `-i -F DenseMap` | 118 ms | **119 ms** | 181 ms | 1.52x faster |
+| `-F getOperandBundle` (defaults) | 140 ms | **139 ms** | 192 ms | 1.38x faster |
+| `-g "*.cpp" -F getOperandBundle` (defaults) | 50 ms | **50 ms** | 61 ms | 1.23x faster |
+| `-l -F getOperandBundle` (defaults) | 140 ms | **139 ms** | 192 ms | 1.37x faster |
+| `-c -F getOperand` (defaults) | 140 ms | **139 ms** | 195 ms | 1.40x faster |
+| `-w Value` | 148 ms | **146 ms** | 182 ms | 1.25x faster |
+| `Fixup[A-Z][a-z]+` | 123 ms | **123 ms** | 169 ms | 1.37x faster |
+| `std::unique_ptr<\w+>` | 124 ms | **123 ms** | 173 ms | 1.41x faster |
+| `class \w+ : public \w+` | 210 ms | **125 ms** | 178 ms | 1.43x faster |
+| `llvm::\w+::\w+\(` | 126 ms | **125 ms** | 175 ms | 1.39x faster |
+| `isa<CallInst>\|dyn_cast<LoadInst>\|getTerminator` | 147 ms | **142 ms** | 180 ms | 1.27x faster |
+| `getOperand\|struct [A-Z]\w+Info` | 149 ms | **143 ms** | 188 ms | 1.31x faster |
+| `%[0-9]+ = load` | 132 ms | **128 ms** | 197 ms | 1.54x faster |
+| `^\s*// CHECK-NEXT:\s+%\w+` | 128 ms | **125 ms** | 174 ms | 1.40x faster |
+| `[0-9a-f]{16}` | 589 ms | **158 ms** | 446 ms | 2.83x faster |
+| `[A-Za-z_]{30,}` | 1,038 ms | **156 ms** | 478 ms | 3.07x faster |
+| `[0-9]{5,}` | 440 ms | **177 ms** | 643 ms | 3.62x faster |
+
+**21 of 21.** The literal rows don't move: the changes only touch them
+through `probes`, which keeps their end probes.
+
+### The other fixtures
+
+No regressions on the kernel and Redis queries of `bench/regex.sh` and
+Experiment 15 (`-uu -n`, base → new, ripgrep):
+
+| | PCRE2 build | default build | ripgrep |
+|:---|---:|---:|---:|
+| kernel `[0-9a-f]{16}` | 378 → **97 ms** | 1,369 → **99 ms** | 285 ms |
+| kernel `^\s*#\s*define\s+[A-Z_]+\s+0x[0-9a-fA-F]+` | 148 → **116 ms** | 539 → **114 ms** | 155 ms |
+| kernel `PM_RESUME\|ERR_PTR\|struct [a-z]+_ops` | 119 → **118 ms** | 231 → **118 ms** | 121 ms |
+| kernel `PM_[A-Z_]+` | 78 → **75 ms** | 80 → **74 ms** | 97 ms |
+| kernel `-F PM_RESUME` | **72** → 73 ms | 74 → **72 ms** | 90 ms |
+| kernel `-i 'todo\|fixme'` | 91 → **89 ms** | 89 → **86 ms** | 104 ms |
+| kernel `-w ERR_PTR` | **72** → 74 ms | 78 → **75 ms** | 95 ms |
+| Redis `[0-9]{3,}` | 6.7 → **5.1 ms** | 11.6 → **5.8 ms** | 7.4 ms |
+
+The rest (`\bERR_PTR\(-E[A-Z]+\)`, `\w+_lock_irqsave\(`,
+`(spin|mutex)_lock\(`, the three-literal alternation, `dict(Find|Delete)\(`)
+moved by at most 6 ms, and by at most 1.2 ms where slower. The two builds are now within a few
+percent of each other everywhere: PCRE2 no longer buys speed, only `\b`
+patterns on its engine. The agent session (`bench/agent.sh`) went from
+81.8 to **60.1 ms** on the default build and 62.2 to **55.6 ms** with
+PCRE2 (ripgrep 89.4 ms); call 14, `[0-9a-f]{16}`, from 17.4 to 4.7 ms, and
+ffs now wins all 15 calls.
+
+### Correctness
+
+All 97 compat checks against ripgrep pass on both builds, and the docs
+examples (`tests/docs.sh`) pass. New tests: the DFA is checked against the
+backtracking reference in the randomized regex test (5,000 patterns), and
+its whole-buffer search against the VM line by line (3,000 patterns, with
+empty lines and with and without a final '\n'); a pattern with too many
+states (`a[ab]{14}c`) must make the DFA clear or give up and still answer
+right; `findLinesRun` is checked against a line-by-line reference; the
+randomized test also asserts that every matching line has the class run,
+and that an exact run is the whole answer.
+
 ## Next steps
 
 - Run on more machines: `bench/threads.sh` on another Mac (does `-j auto`
@@ -1371,10 +1549,14 @@ regex loss. The no-literal patterns are still 1.25–2x behind ripgrep.
   16-thread box.
 - Case-sensitive matcher on x86: 1.4–1.7x slower than `-i` on the Ryzen,
   2–40% faster on the M5 (Experiment 16). Look at what the AVX2 build emits.
-- Regex without a literal: this is now the largest gap on both machines
-  (Linux 1.5–10x, Experiment 15; macOS 1.25–2x, Experiment 16). The
-  multi-literal prefilter closed `todo|fixme`; what is left needs a lazy
-  DFA, if the code size is acceptable.
+- Regex without a literal: closed on Linux by the lazy DFA and the
+  class-run scan (Experiment 17). Re-measure on the M5, where Experiment 16
+  had it 1.25–2x behind.
+- `\b` in the DFA: `-w` and `\b` patterns still run on the Pike VM (or
+  PCRE2). An ASCII-only `\b` would be one byte of lookbehind in the state;
+  ffs's Unicode `\b` needs the DFA to fall back only on non-ASCII bytes.
+- A DFA skip loop: while the DFA sits in its start state, jump with SIMD to
+  the next byte that can start a match (`first`), as the Pike VM does.
 - Ignore files (`.gitignore`), probably as an option, since searching
   everything is the point of the current benchmarks.
 - Unicode: case folding for `-i`, Unicode `\w`/`\b` for `-E`.

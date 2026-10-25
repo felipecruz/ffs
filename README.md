@@ -49,25 +49,26 @@ The 15 calls in `bench/agent.sh`, the kinds of search agents run
 
 | # | What the agent wants | Call | ffs | ripgrep | |
 |---:|:---|:---|---:|---:|:---|
-| 1 | Find the build files and docs | `rg --files -g '*README*' -g Makefile -g '*.sh' -g AGENTS.md` | **4.0 ms** | 6.5 ms | 1.6x faster |
-| 2 | Look for agent instructions | `rg --files --hidden -g '*instructions*' -g CLAUDE.md -g AGENTS.md` | **4.0 ms** | 6.5 ms | 1.7x faster |
-| 3 | Guess a symbol's name | `rg -n 'dictFind\|dictAdd\|dictDelete' src` | **5.1 ms** | 6.9 ms | 1.4x faster |
-| 4 | Jump to a declaration | `rg -n 'struct redisServer \{\|struct client \{' src/server.h` | **1.0 ms** | 2.1 ms | 2.0x faster |
-| 5 | Read a function body | `rg -n -A40 '^dictEntry \*dictFind\(' src/dict.c` | **1.0 ms** | 2.0 ms | 2.0x faster |
-| 6 | Spell out case variants | `rg -n 'lazyfree\|lazyFree\|LazyFree' src` | **5.0 ms** | 8.1 ms | 1.6x faster |
-| 7 | Search the whole repo | `rg -n serverAssert` | **11.0 ms** | 12.0 ms | 1.1x faster |
-| 8 | Count uses per file | `rg -c 'serverLog\(LL_WARNING' src` | 6.6 ms | 6.7 ms | about the same |
-| 9 | Which files call it | `rg -l aeCreateFileEvent src` | **4.8 ms** | 6.8 ms | 1.4x faster |
-| 10 | Whole word only | `rg -w -n dictSize src` | **4.9 ms** | 6.9 ms | 1.4x faster |
-| 11 | Pull out IDs | `rg -o -n 'REDIS_VERSION "[0-9.]+"\|RDB_VERSION [0-9]+' src` | **4.9 ms** | 7.0 ms | 1.4x faster |
-| 12 | Tests that mention it | `rg -n -g '*.tcl' 'lazyfree' tests` | **4.2 ms** | 5.2 ms | 1.2x faster |
-| 13 | Read a saved test log | `rg -n 'err\]\|exception\]\|Executed [0-9]+ tests'` | **2.8 ms** | 3.6 ms | 1.3x faster |
-| 14 | Regex with no literal | `rg -n '[0-9a-f]{16}' src` | 17.4 ms | **7.1 ms** | 2.4x slower |
-| 15 | Alternation with a common word | `rg -n 'dictFind\|struct [a-z]+ \{' src` | **5.3 ms** | 7.0 ms | 1.3x faster |
+| 1 | Find the build files and docs | `rg --files -g '*README*' -g Makefile -g '*.sh' -g AGENTS.md` | **3.9 ms** | 6.4 ms | 1.7x faster |
+| 2 | Look for agent instructions | `rg --files --hidden -g '*instructions*' -g CLAUDE.md -g AGENTS.md` | **3.9 ms** | 6.4 ms | 1.7x faster |
+| 3 | Guess a symbol's name | `rg -n 'dictFind\|dictAdd\|dictDelete' src` | **4.8 ms** | 7.0 ms | 1.4x faster |
+| 4 | Jump to a declaration | `rg -n 'struct redisServer \{\|struct client \{' src/server.h` | **1.1 ms** | 2.1 ms | 1.8x faster |
+| 5 | Read a function body | `rg -n -A40 '^dictEntry \*dictFind\(' src/dict.c` | **1.0 ms** | 2.0 ms | 1.9x faster |
+| 6 | Spell out case variants | `rg -n 'lazyfree\|lazyFree\|LazyFree' src` | **4.8 ms** | 7.0 ms | 1.5x faster |
+| 7 | Search the whole repo | `rg -n serverAssert` | **5.4 ms** | 8.3 ms | 1.5x faster |
+| 8 | Count uses per file | `rg -c 'serverLog\(LL_WARNING' src` | **4.6 ms** | 6.8 ms | 1.5x faster |
+| 9 | Which files call it | `rg -l aeCreateFileEvent src` | **4.5 ms** | 6.7 ms | 1.5x faster |
+| 10 | Whole word only | `rg -w -n dictSize src` | **4.6 ms** | 7.0 ms | 1.5x faster |
+| 11 | Pull out IDs | `rg -o -n 'REDIS_VERSION "[0-9.]+"\|RDB_VERSION [0-9]+' src` | **4.8 ms** | 7.0 ms | 1.5x faster |
+| 12 | Tests that mention it | `rg -n -g '*.tcl' 'lazyfree' tests` | **4.0 ms** | 5.1 ms | 1.3x faster |
+| 13 | Read a saved test log | `rg -n 'err\]\|exception\]\|Executed [0-9]+ tests'` | **2.9 ms** | 3.4 ms | 1.2x faster |
+| 14 | Regex with no literal | `rg -n '[0-9a-f]{16}' src` | **4.7 ms** | 7.2 ms | 1.5x faster |
+| 15 | Alternation with a common word | `rg -n 'dictFind\|struct [a-z]+ \{' src` | **4.9 ms** | 7.1 ms | 1.4x faster |
 
-The whole session: **ffs 82 ms, ripgrep 94 ms.** The one regex with no
-fixed text in it costs ffs 10 ms more than ripgrep, which gives back almost
-half of the 23 ms it gains on the other 14 calls.
+The whole session: **ffs 60 ms, ripgrep 89 ms.** ffs is faster on all 15
+calls, including the regex with no fixed text in it (call 14), which a lazy
+DFA and a SIMD scan for runs of a character class brought from 17.4 ms to
+4.7 ms.
 
 ### A big tree
 
@@ -79,8 +80,8 @@ The Linux kernel source (1.9 GB, 92,000 files):
 | List files, `--files` | **27 ms** | 32 ms | 1.2x faster |
 | Alternation `PM_RESUME\|ERR_PTR\|dictFind` | **106 ms** | 124 ms | 1.2x faster |
 | Case-insensitive `-i 'todo\|fixme'` | **102 ms** | 125 ms | 1.2x faster |
-| Alternation with a common word `spin_lock\|mutex_lock\|struct [a-z]+_ops` | 269 ms | **149 ms** | 1.8x slower |
-| Regex with no literal `[0-9a-f]{16}` | 1,459 ms | **306 ms** | 4.8x slower |
+| Alternation with a common word `spin_lock\|mutex_lock\|struct [a-z]+_ops` | **119 ms** | 135 ms | 1.1x faster |
+| Regex with no literal `[0-9a-f]{16}` | **99 ms** | 286 ms | 2.9x faster |
 
 Searching everything (`-uu` for both tools, so no ignore files), on the
 same machine and on an Apple M5 with macOS, where ffs runs on the 4
@@ -91,7 +92,10 @@ performance cores:
 | Rare word `PM_RESUME` | **74 ms** | 94 ms | 0.85 s | **0.84 s** | 1.93 s |
 | Common word `ERR_PTR` | **84 ms** | 102 ms | **0.84 s** | 0.85 s | 1.90 s |
 | Regex `PM_[A-Z_]+` | **81 ms** | 104 ms | **0.87 s** | 0.91 s | 2.02 s |
-| Regex with no literal `[0-9a-f]{16}` | 1,361 ms | **281 ms** | 2.30 s | **1.33 s** | 1.67 s |
+| Regex with no literal `[0-9a-f]{16}` | **98 ms** | 277 ms | 2.30 s\* | **1.33 s** | 1.67 s |
+
+\* Measured before the lazy DFA and the class-run scan (Experiment 17),
+which made this search 14x faster on Linux; not yet re-measured on the M5.
 
 With both tools held to the same thread count (`bench/h2h.sh`, Linux,
 `PM_RESUME`):
@@ -107,30 +111,30 @@ With both tools held to the same thread count (`bench/h2h.sh`, Linux,
 | Binary | **410 KB** | 6.5 MB |
 | Dependencies | none | PCRE2 |
 
-**Where ripgrep wins:** regexes that don't contain a fixed piece of text,
-or where that text is very common. ripgrep has a real regex engine; ffs
-has a small one, and it is the slow part. The optional PCRE2 build closes
-most of that gap.
+**Regexes:** ffs looks for a fixed piece of text every match must contain
+(`PM_` in `PM_[A-Z_]+`) or, failing that, a run of one character class
+(16 hex digits in `[0-9a-f]{16}`), with SIMD, and checks the few lines
+that have it with a lazy DFA. On the LLVM monorepo (188,000 files, 3.1
+GB), ffs is faster than ripgrep on all 21 searches in `bench/llvm.sh`,
+1.2x to 3.6x (`results-linux/llvm-pcre2/`).
 
 ### Optional: the PCRE2 build
 
 `zig build -Dpcre2=true` links the system's PCRE2 and lets its JIT do the
-small regex engine's work: checking the lines the SIMD prefilter finds, and
-scanning whole files when a regex has no fixed text. Matching rules don't
-change (the same 97 compat checks pass), but the binary needs libpcre2-8
-installed.
+work the lazy DFA can't: patterns with `\b` (`-w`), and patterns whose DFA
+would need too many states. Matching rules don't change (the same 97 compat
+checks pass), but the binary needs libpcre2-8 installed. Since the DFA,
+the two builds are within a few percent of each other (`-uu -n`):
 
-| Linux kernel source | ffs | **ffs + PCRE2** | ripgrep |
+| Linux kernel source | ffs | ffs + PCRE2 | ripgrep |
 |:---|---:|---:|---:|
-| Regex with no literal `[0-9a-f]{16}` | 1,382 ms | 392 ms | **296 ms** |
-| Alternation with a common word `spin_lock\|mutex_lock\|struct [a-z]+_ops` | 261 ms | **123 ms** | 140 ms |
-| `^\s*#\s*define\s+[A-Z_]+\s+0x[0-9a-fA-F]+` | 548 ms | **159 ms** | 170 ms |
-| Regex with a literal `PM_[A-Z_]+` | **87 ms** | 91 ms | 113 ms |
+| Regex with no literal `[0-9a-f]{16}` | **95 ms** | **95 ms** | 280 ms |
+| Alternation with a common word `spin_lock\|mutex_lock\|struct [a-z]+_ops` | **113 ms** | **112 ms** | 127 ms |
+| `^\s*#\s*define\s+[A-Z_]+\s+0x[0-9a-fA-F]+` | **116 ms** | 118 ms | 155 ms |
+| Regex with a literal `PM_[A-Z_]+` | **74 ms** | 78 ms | 97 ms |
 
-On the agent session above, PCRE2 brings the regex with no literal from
-17.4 ms to 8.4 ms (ripgrep: 7.1 ms), and the whole session to **62 ms
-against ripgrep's 89 ms** (`results-linux/pcre2/agent.md`). ripgrep still
-wins on regexes with no fixed text, by 1.2–1.3x instead of 2.4–4.7x.
+On the agent session above, the PCRE2 build takes **56 ms against
+ripgrep's 89 ms** (`results-linux/pcre2/agent.md`).
 
 **Why ffs is fast elsewhere:** two ideas, done carefully.
 
@@ -149,8 +153,9 @@ wins on regexes with no fixed text, by 1.2–1.3x instead of 2.4–4.7x.
 | `src/walk.zig` | 321 | Parallel directory walk: worker pool over one queue; hidden, ignore files, `-g` |
 | `src/glob.zig` | 229 | Globs and gitignore rules |
 | `src/search.zig` | 427 | Thread pool; stream each file, skip binaries, ripgrep's output modes |
-| `src/match.zig` | 198 | SIMD search, one term or several |
-| `src/regex.zig` | 690 | Regex: parser, literal prefilter, Pike VM |
+| `src/match.zig` | 372 | SIMD search: one term or several, or a run of a character class |
+| `src/regex.zig` | 827 | Regex: parser, literal and class-run prefilters, Pike VM |
+| `src/dfa.zig` | 249 | Lazy DFA: one table lookup per byte to check a line or scan a buffer |
 | `src/c_api.zig` | 95 | Optional C library (`include/ffs.h`) |
 | `src/pcre.zig` | 48 | Optional PCRE2 JIT backend (`-Dpcre2=true`) |
 
@@ -158,14 +163,19 @@ The line counts exclude comments, blank lines and tests.
 
 **The SIMD loop.** For each 16-byte block, ffs compares the block with the
 term's first byte, and the block shifted by `len - 1` with its last byte.
-Only positions where both match get a full comparison. The same loaded
-block feeds per-lane newline counters, so line numbers cost one extra
-instruction per 16 bytes.
+Only positions where both match get a full comparison. When those two
+bytes are common (the spaces around `" : public "`), it compares the
+term's two rarest bytes instead, by a byte-frequency table from real
+source trees. The same loaded block feeds per-lane newline counters, so
+line numbers cost one extra instruction per 16 bytes.
 
 **Regex without a regex engine's complexity.** ffs takes the text every
 match must contain (`PM_` in `PM_[A-Z_]+`, or one of `cancel` and `launch`
-in `func (cancel|launch)`) and lets the SIMD loop find candidate lines. Only those lines go to a small Pike VM, which runs in
-linear time with no backtracking, so no pattern can blow up.
+in `func (cancel|launch)`) and lets the SIMD loop find candidate lines.
+With no such text, a SIMD scan finds runs of a character class
+(`[0-9a-f]{16}`) instead. Only the lines found go to a lazy DFA, one
+table lookup per byte, built on demand from a small Pike VM's program.
+Both run in linear time with no backtracking, so no pattern can blow up.
 
 **Streaming.** Files go through a 256 KiB buffer, never loaded whole. A
 small file costs exactly `open`, `read` and `close`.

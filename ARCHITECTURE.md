@@ -13,9 +13,10 @@ file's bytes: the 16-byte SIMD loop in `src/match.zig`. Measurements are in
 | `src/glob.zig` | Globs and gitignore rule sets, for `-g` and ignore files |
 | `src/search.zig` | `run`: paths (directories, files, stdin), thread pool, walk; per-file work: open, read (streaming, or whole for context lines and `-v`), binary check, ripgrep's output modes |
 | `src/c_api.zig` | C ABI (`include/ffs.h`): `ffs_search` with a callback, over `search.run` |
-| `src/match.zig` | Finding the term in bytes (SIMD), with no I/O; naive reference and randomized test |
-| `src/pcre.zig` | With `-Dpcre2=true`: PCRE2's JIT replaces the Pike VM for line checks, `-o` and buffers with no literal; patterns with `\b` stay on the VM |
-| `src/regex.zig` | Regex parser, compiler and Pike VM, behind the SIMD search as a prefilter; `Vm.find` gives match positions for `-o` |
+| `src/match.zig` | Finding the term in bytes (SIMD), with no I/O, or runs of a character class (`findLinesRun`); the byte-frequency table; naive reference and randomized tests |
+| `src/pcre.zig` | With `-Dpcre2=true`: PCRE2's JIT replaces the Pike VM where the DFA can't answer (`\b`, a DFA that gave up) and for `-o` |
+| `src/regex.zig` | Regex parser, compiler and Pike VM, behind the SIMD search as a prefilter (a literal, or a class run); `Vm.find` gives match positions for `-o` |
+| `src/dfa.zig` | Lazy DFA over the VM's program: `isMatch` for a line, `findLines` over a whole buffer; gives up on patterns that need too many states |
 | `src/bench_match.zig` | Matcher microbenchmark (`bench/match.sh`, EXPERIMENTS.md, Experiment 8) |
 
 The layers connect through two small interfaces that are resolved at compile
@@ -146,7 +147,7 @@ const end = data.len - n + 1;             // valid start positions are [0, end)
 var nl_acc: Vec = @splat(0);              // per-lane newline counters (u8)
 ```
 
-### The main loop (`match.zig:73`)
+### The main loop (`match.zig:81`)
 
 Each iteration examines **16 candidate start positions** `i … i+15` at
 once, and counts the newlines among bytes `i … i+15`:
@@ -188,6 +189,17 @@ This is the "first and last byte" filter, also known as Wojciech Muła's
   `mask &= mask - 1` clears that bit to move on to the next one.
 - Only a surviving candidate pays for a full `std.mem.eql` against the
   term.
+
+**Rare probes.** First and last byte are a poor filter when both are
+common: for `" : public "` both are spaces, and almost every indented line
+is a candidate. `match.probes` then picks the term's two rarest bytes
+(`:` and `b`), by `match.rarity`, -4·log2 of each byte's frequency in 470
+MB of the LLVM, Linux and Redis trees. The switch happens only when the
+ends pass more than one position in 1024 and the rare pair is at least 4x
+better: the extra load costs more than a few false candidates. The two
+cases are separate comptime copies of the loop, so the usual one is
+unchanged. On LLVM, `class \w+ : public \w+` went from 195 ms to 126 ms
+(EXPERIMENTS.md, Experiment 17).
 
 LLVM compiles the candidate test as `cmeq`, `cmeq`, `and`, then `umaxv`
 (horizontal max) and a branch. It builds the actual bitmask only when some
@@ -251,7 +263,7 @@ generated code per 16 bytes is then: `ldr` and `ldur` (2 loads), three
 counters, plus the 255-block counter check and the loop branch (verified in
 the emitted assembly).
 
-### Ignoring case (`-i`, `Byte` at `match.zig:114`)
+### Ignoring case (`-i`, `Byte` at `match.zig:404`)
 
 `findLines` and `findLinesIgnoreCase` both call `find(comptime case, ...)`,
 so each gets its own copy of the loop. In the case-sensitive copy,
@@ -282,7 +294,7 @@ common than `P…E` in C source (EXPERIMENTS.md, Experiment 10). An earlier vers
 compared each block with both the lower- and upper-case byte and ORed the
 masks. It was 7% slower.
 
-### Reporting a match: `report` (`match.zig:161`)
+### Reporting a match: `report` (`match.zig:451`)
 
 `report` is called with `line` already equal to the match's line number:
 
@@ -304,36 +316,36 @@ reads at newlines. The cost is paid only by sinks that call it, so `-c`
 and `-l` do no extra work. When it is called, the backward scan covers
 only the part of the line before the match.
 
-### The tail (`match.zig:97`)
+### The tail (`match.zig:106`)
 
 Once fewer than 16 candidate positions remain (`i + 16 > end`), a scalar
 loop checks them one at a time: `data[i] == term[0]`, then `eql`. It counts
 newlines as it goes. The last `n - 1` bytes can't start a match, but their
 newlines still count, so they are added with `countScalar`
-(`match.zig:106`). This happens once per `findLines` call, so it covers at
+(`match.zig:115`). This happens once per `findLines` call, so it covers at
 most 15 positions per 256 KiB read. For small files, which are most files,
 it is the last 15 positions of the file.
 
 ### Correctness
 
-`findLinesNaive` (`match.zig:171`) is the original pointer-walking version.
+`findLinesNaive` (`match.zig:461`) is the original pointer-walking version.
 Two randomized tests check that both versions report exactly the same line
 numbers **and** return the same line number after the data. For every
 match, they also check `m.text()` against an independent oracle: the
 corresponding line from splitting `data` on `\n`.
 
-- `"SIMD search matches naive search"` (`match.zig:212`): 20,000 cases
+- `"SIMD search matches naive search"` (`match.zig:502`): 20,000 cases
   with data up to 600 bytes over `a`, `b`, `A`, `B` and `\n`, terms of 1–8 bytes and
   a random `first_line`. The small alphabet makes candidates, overlapping
   matches and block boundaries very frequent.
-- `"... on long inputs"` (`match.zig:242`): 300 cases longer than 255
+- `"... on long inputs"` (`match.zig:532`): 300 cases longer than 255
   blocks, with newline density 1/40, 1/2 or every byte. This exercises the
   periodic `flush`. Removing the flush makes this test fail with an integer
   overflow, which was verified.
 
 Both randomized tests use upper- and lower-case `a`/`b` and check `find(.sensitive, ...)` and `find(.insensitive, ...)` against
 `findLinesNaive` with the same `case`. `"ignore case folds ASCII letters
-only"` (`match.zig:274`) checks `[`/`{` and a UTF-8 `Ö`. Disabling the
+only"` (`match.zig:608`) checks `[`/`{` and a UTF-8 `Ö`. Disabling the
 fold in the SIMD loop makes the first randomized test fail (verified).
 
 Run them with `zig build test`.
@@ -343,8 +355,10 @@ Run them with `zig build test`.
 A regex search is a literal search plus a filter:
 
 ```
-pattern ─► parse (tree) ─► compile (NFA program) ─► required literal
-data    ─► match.findLines(literal) ─► candidate line ─► Pike VM: any match? ─► sink
+pattern ─► parse (tree) ─► compile (NFA program) ─► required literal, or class run
+data    ─► match.findLines(literal) ─► candidate line ─► DFA: any match? ─► sink
+           match.findLinesRun(class run)  ┘
+           (neither) ─► DFA over the whole buffer ───────────────────────► sink
 ```
 
 1. **Parse.** A recursive-descent parser builds a tree of `Node`s. There
@@ -355,23 +369,50 @@ data    ─► match.findLines(literal) ─► candidate line ─► Pike VM: an
 2. **Compile** to a Thompson NFA program: `set`, `split`, `jmp`, `bol`,
    `eol`, `word_boundary` and `match`. `e{n,m}` is expanded into copies of
    `e`, and programs are capped at 10,000 instructions.
-3. **Required literal.** This is the longest run of single bytes that every
-   match must contain (`PM_` in `PM_[A-Z_]+`, `define` in
-   `^\s*#\s*define\s+...`). Alternations and optional parts contribute
-   nothing.
-4. **Search.** If there is a literal, the SIMD `match.findLines` (or
-   `findLinesIgnoreCase`) runs with it, and its sink is a `Filter` that
-   passes a line on only if the VM accepts `m.text()`. Line numbering,
-   chunking and output are all reused unchanged. Without a literal
-   (`[0-9a-f]{16}`, `todo|fixme`), every line goes to the VM.
-5. **Pike VM.** All NFA threads advance in lockstep, one byte at a time,
+3. **Required literal.** A run of single bytes that every match must
+   contain (`PM_` in `PM_[A-Z_]+`, `define` in `^\s*#\s*define\s+...`),
+   or a set of them from an alternation. Of the candidates, the one that
+   should be rarest in source code wins (`score`: the bytes' `rarity`
+   summed, less 4 bits per extra literal, since the SIMD search for two
+   takes ~40% longer than for one). Optional parts contribute nothing.
+4. **Class run.** With no literal, a run of at least `min` bytes from one
+   class that every match contains: 16 from `[0-9a-f]` in
+   `[0-9a-f]{16}`, 30 from `[A-Za-z_]` in `[A-Za-z_]{30,}`. Adjacent sets
+   merge when one contains the other. It is used only if the class has at
+   most 4 ranges and the run is rare (8 bits or more: `\w{3}` is not).
+   `match.findLinesRun` tests each block's bytes against the ranges with
+   wrapping subtract-and-compare, then finds runs in the bitmask by
+   AND-ing it with itself shifted (log2(min) steps), carrying a run's
+   length across blocks. When the regex is the run and nothing else, the
+   scan's lines are the answer.
+5. **Search.** With a literal, the SIMD `match.findLines` (or
+   `findLinesIgnoreCase`, `findLinesAny`) runs with it, and its sink is a
+   `Filter` that passes a line on only if `Vm.isMatch` accepts
+   `m.text()`; a class run works the same way. Line numbering, chunking
+   and output are all reused unchanged. With neither (`todo|fixme`,
+   `[0-9]+x`), the DFA runs over the whole buffer.
+6. **Lazy DFA** (`src/dfa.zig`). A state is the set of VM threads alive at
+   a position; transitions are computed the first time they are taken and
+   cached in a table with one entry per byte class (bytes every `set`
+   treats alike; '\n' is its own). Every transition also starts a new
+   thread at pc 0, so a state covers matches starting anywhere before it.
+   Any thread reaching `match` makes the state `found`; no threads is
+   `dead`, and the rest of the line is skipped with `memchr`. `$` threads
+   wait in the state until the line ends. Run over a whole buffer, '\n'
+   ends the line and returns to the start state, so the inner loop is one
+   lookup and one compare per byte. The cache is 2 MB per thread and is
+   cleared when full; if it fills again after fewer than 10 bytes per
+   state, the DFA gives up for good (`failed`) and the VM (or PCRE2) takes
+   over. `\b` isn't supported, since ffs's `\b` looks at whole UTF-8
+   characters; those patterns use the VM.
+7. **Pike VM.** All NFA threads advance in lockstep, one byte at a time,
    and a new thread starts at every position (an unanchored search). A
    generation-stamped `seen` array keeps each instruction at most once per
    position. It stops at the first `match`: only "does this line match?"
    is needed, not where. The cost is O(line × program) with no
    backtracking, so `(a*)*b` is as safe as `ab`. The scratch arrays (`Vm`)
    live in each task's `Local`, sized once from the program.
-6. **First-byte skip.** `first` is the set of bytes that can start a match
+8. **First-byte skip.** `first` is the set of bytes that can start a match
    (`t T f F` for `-i todo|fixme`). While no thread is alive, the VM jumps
    straight to the next such byte instead of starting a thread at every
    position. This roughly halves the time for patterns with no literal
@@ -385,9 +426,15 @@ exactly (EXPERIMENTS.md, Experiment 11).
 **Tests:**
 - table-driven syntax, error and literal-extraction cases;
 - a randomized test (5,000 patterns × 20 lines, with and without `-i`)
-  comparing the VM against a small backtracking matcher that walks the
-  parse tree directly. It also asserts that every matching line contains
-  the required literal, so the prefilter can never drop a match;
+  comparing the VM and the DFA against a small backtracking matcher that
+  walks the parse tree directly. It also asserts that every matching line
+  contains the required literal and the class run, so neither prefilter
+  can drop a match;
+- a randomized test of the DFA's whole-buffer `findLines` (3,000 patterns,
+  buffers with empty lines and with and without a final '\n') against the
+  VM line by line, and one that the DFA gives up and still answers right
+  on a pattern with too many states;
+- a randomized test of `findLinesRun` against a line-by-line reference;
 - a check that the prefiltered and every-line paths give the same lines
   and line numbers.
 
@@ -401,12 +448,12 @@ How many times each byte is touched, for one read:
 | Pass | Where | Step | Notes |
 |---|---|---|---|
 | NUL check | `search.zig:183` | SIMD (std) | every byte |
-| match scan + newline count, `a` load | `match.zig:74` | 16 B | every byte, except skipped rest-of-line after a match |
-| match scan, `b` load | `match.zig:75` | 16 B | same bytes, shifted by `n - 1` (mostly L1 hits) |
-| candidate check | `match.zig:81` | `eql`, byte-wise | only where first and last byte both match |
+| match scan + newline count, `a` load | `match.zig:82` | 16 B | every byte, except skipped rest-of-line after a match |
+| match scan, `b` load | `match.zig:84` | 16 B | same bytes, shifted by `n - 1`, or by the rare probe offsets (mostly L1 hits) |
+| candidate check | `match.zig:90` | `eql`, byte-wise | only where both probe bytes match |
 | last newline | `search.zig:187` | **1 B, backwards** | stops at the last `\n`, usually within one line |
 | carry | `search.zig:192` | memmove | only the partial last line |
-| tail | `match.zig:97` | **1 B** | at most 15 positions per call |
+| tail | `match.zig:106` | **1 B** | at most 15 positions per call |
 
 So each byte is read about **twice** (NUL check, then the combined match
 scan and newline count), each pass 16 bytes at a time. Byte-by-byte work is
