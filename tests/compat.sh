@@ -45,7 +45,11 @@ RG=$(command -v rg)
 # Output filters: NUL bytes as newlines (the shell drops NULs), and --json
 # with its timings taken out, the one part that can't be the same.
 nul() { tr '\0' '\n'; }
-json() { sed -E 's/"elapsed(_total)?":\{[^}]*\}/"elapsed\1":{}/g'; }
+# ripgrep before 15 also counts files without a match in the summary's
+# searches and bytes_searched; ffs counts as 15 does.
+rg_major=$("$RG" --version | sed -nE '1s/^ripgrep ([0-9]+).*/\1/p')
+if [ "${rg_major:-15}" -ge 15 ]; then old_stats=; else old_stats='s/"(bytes_searched|searches)":[0-9]+/"\1":0/g;'; fi
+json() { sed -E "$old_stats"'s/"elapsed(_total)?":\{[^}]*\}/"elapsed\1":{}/g'; }
 # check [sort|raw] [--stdin TEXT] [--cd DIR] [--filter nul|json] [--fallback] ARGS...
 # --fallback runs ffs with FFS_RG set, for command lines it hands to rg.
 check() {
