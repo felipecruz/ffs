@@ -2,11 +2,13 @@
 
 [![CI](https://github.com/felipecruz/ffs/actions/workflows/ci.yml/badge.svg)](https://github.com/felipecruz/ffs/actions/workflows/ci.yml)
 
-**ripgrep's command line, in about 2,300 lines of Zig.** It takes the
+**ripgrep's command line, in about 3,000 lines of Zig.** It takes the
 flags coding agents actually use (`-n`, `-g`, `--files`, `-o`, `-c`, `-l`,
 `-v`, `-A/-B/-C`, …), respects `.gitignore`, and prints exactly what
 ripgrep prints (`tests/compat.sh` checks 97 command lines). It is faster
-than ripgrep on most searches and slower on some, all listed below.
+than ripgrep on every search benchmarked below, on the Linux kernel, Redis
+and LLVM trees, regexes included; the one kind of regex where it is still
+slower is under Limitations.
 
 ![ffs searching the Linux kernel source, and ripgrep for comparison](docs/demo.gif)
 
@@ -72,16 +74,17 @@ DFA and a SIMD scan for runs of a character class brought from 17.4 ms to
 
 ### A big tree
 
-The Linux kernel source (1.9 GB, 92,000 files):
+The Linux kernel source (1.9 GB, 92,000 files), each tool with its
+defaults (hidden and ignored files skipped):
 
 | Search | **ffs** | ripgrep | |
 |:---|---:|---:|:---|
-| Word `PM_RESUME` | **84 ms** | 110 ms | 1.3x faster |
-| List files, `--files` | **27 ms** | 32 ms | 1.2x faster |
-| Alternation `PM_RESUME\|ERR_PTR\|dictFind` | **106 ms** | 124 ms | 1.2x faster |
-| Case-insensitive `-i 'todo\|fixme'` | **102 ms** | 125 ms | 1.2x faster |
-| Alternation with a common word `spin_lock\|mutex_lock\|struct [a-z]+_ops` | **119 ms** | 135 ms | 1.1x faster |
-| Regex with no literal `[0-9a-f]{16}` | **99 ms** | 286 ms | 2.9x faster |
+| Word `PM_RESUME` | **77 ms** | 99 ms | 1.3x faster |
+| List files, `--files` | **26 ms** | 30 ms | 1.1x faster |
+| Alternation `PM_RESUME\|ERR_PTR\|dictFind` | **96 ms** | 110 ms | 1.1x faster |
+| Case-insensitive `-i 'todo\|fixme'` | **93 ms** | 112 ms | 1.2x faster |
+| Alternation with a common word `spin_lock\|mutex_lock\|struct [a-z]+_ops` | **117 ms** | 134 ms | 1.1x faster |
+| Regex with no literal `[0-9a-f]{16}` | **102 ms** | 288 ms | 2.8x faster |
 
 Searching everything (`-uu` for both tools, so no ignore files), on the
 same machine and on an Apple M5 with macOS, where ffs runs on the 4
@@ -89,10 +92,10 @@ performance cores:
 
 | Search | **ffs** Linux | ripgrep Linux | **ffs** macOS | ripgrep `-j4` macOS | ripgrep macOS |
 |:---|---:|---:|---:|---:|---:|
-| Rare word `PM_RESUME` | **74 ms** | 94 ms | 0.85 s | **0.84 s** | 1.93 s |
-| Common word `ERR_PTR` | **84 ms** | 102 ms | **0.84 s** | 0.85 s | 1.90 s |
-| Regex `PM_[A-Z_]+` | **81 ms** | 104 ms | **0.87 s** | 0.91 s | 2.02 s |
-| Regex with no literal `[0-9a-f]{16}` | **98 ms** | 277 ms | 2.30 s\* | **1.33 s** | 1.67 s |
+| Rare word `PM_RESUME` | **72 ms** | 91 ms | 0.85 s | **0.84 s** | 1.93 s |
+| Common word `ERR_PTR` | **73 ms** | 95 ms | **0.84 s** | 0.85 s | 1.90 s |
+| Regex `PM_[A-Z_]+` | **74 ms** | 98 ms | **0.87 s** | 0.91 s | 2.02 s |
+| Regex with no literal `[0-9a-f]{16}` | **97 ms** | 281 ms | 2.30 s\* | **1.33 s** | 1.67 s |
 
 \* Measured before the lazy DFA and the class-run scan (Experiment 17),
 which made this search 14x faster on Linux; not yet re-measured on the M5.
@@ -102,8 +105,12 @@ With both tools held to the same thread count (`bench/h2h.sh`, Linux,
 
 | Threads | 1 | 2 | 4 | 8 | 12 | 16 |
 |:---|---:|---:|---:|---:|---:|---:|
-| **ffs** | **580 ms** | **299** | **154** | **88** | **80** | **76** |
-| ripgrep | 898 ms | 372 | 191 | 106 | 90 | 80 |
+| **ffs** | **592 ms** | **305** | **158** | **88** | **78** | **74** |
+| ripgrep | 902 ms | 371 | 192 | 105 | 91 | 81 |
+
+On Redis (25 MB), `dictFind`: ffs 5.3 ms, ripgrep 8.2 ms, grep 19.7 ms
+with each tool's defaults; 5.1 ms against 6.4 ms with `-uu`
+(`results-linux/defaults.md`, `all-text.md`).
 
 | | **ffs** | ripgrep |
 |:---|---:|---:|
@@ -111,12 +118,43 @@ With both tools held to the same thread count (`bench/h2h.sh`, Linux,
 | Binary | **410 KB** | 6.5 MB |
 | Dependencies | none | PCRE2 |
 
-**Regexes:** ffs looks for a fixed piece of text every match must contain
-(`PM_` in `PM_[A-Z_]+`) or, failing that, a run of one character class
-(16 hex digits in `[0-9a-f]{16}`), with SIMD, and checks the few lines
-that have it with a lazy DFA. On the LLVM monorepo (188,000 files, 3.1
-GB), ffs is faster than ripgrep on all 21 searches in `bench/llvm.sh`,
-1.2x to 3.6x (`results-linux/llvm-pcre2/`).
+### Regexes
+
+ffs looks for a fixed piece of text every match must contain (`PM_` in
+`PM_[A-Z_]+`) or, failing that, a run of one character class (16 hex
+digits in `[0-9a-f]{16}`), with SIMD, and checks the few lines that have
+it with a lazy DFA. `bench/regex.sh`, `-uu -n`, kernel and Redis:
+
+| Search | **ffs** | ffs + PCRE2 | ripgrep | |
+|:---|---:|---:|---:|:---|
+| kernel `PM_[A-Z_]+` | **74 ms** | 79 ms | 98 ms | 1.3x faster |
+| kernel `\bERR_PTR\(-E[A-Z]+\)` | **72 ms** | 73 ms | 95 ms | 1.3x faster |
+| kernel `\w+_lock_irqsave\(` | **73 ms** | 74 ms | 97 ms | 1.3x faster |
+| kernel `(spin\|mutex)_lock\(` | **74 ms** | 75 ms | 107 ms | 1.4x faster |
+| kernel `-i 'todo\|fixme'` | **86 ms** | 86 ms | 104 ms | 1.2x faster |
+| kernel `spin_lock\|mutex_lock\|struct [a-z]+_ops` | 114 ms | **109 ms** | 127 ms | 1.1x faster |
+| kernel `^\s*#\s*define\s+[A-Z_]+\s+0x[0-9a-fA-F]+` | **114 ms** | 116 ms | 156 ms | 1.4x faster |
+| kernel `[0-9a-f]{16}` | **97 ms** | 97 ms | 281 ms | 2.9x faster |
+| Redis `dict(Find\|Delete)\(` | 5.5 ms | **5.0 ms** | 6.7 ms | 1.2x faster |
+| Redis `[0-9]{3,}` | 5.9 ms | **5.1 ms** | 7.7 ms | 1.3x faster |
+
+GNU grep takes 30 s on the kernel's `[0-9a-f]{16}`, and 1.4 s on
+`PM_[A-Z_]+`.
+
+On the LLVM monorepo (188,000 files, 3.1 GB, mostly C++), ffs + PCRE2 is
+faster than ripgrep on all 21 searches in `bench/llvm.sh`, 1.2x to 3.6x
+(`results-linux/llvm-pcre2/`):
+
+| LLVM, `-uu -n` | ffs + PCRE2 | ripgrep | |
+|:---|---:|---:|:---|
+| Common word `-F return` | **133 ms** | 253 ms | 1.9x faster |
+| Case-insensitive `-i -F DenseMap` | **119 ms** | 181 ms | 1.5x faster |
+| `class \w+ : public \w+` | **125 ms** | 178 ms | 1.4x faster |
+| `getOperand\|struct [A-Z]\w+Info` | **143 ms** | 188 ms | 1.3x faster |
+| `^\s*// CHECK-NEXT:\s+%\w+` | **125 ms** | 174 ms | 1.4x faster |
+| `[0-9a-f]{16}` | **158 ms** | 446 ms | 2.8x faster |
+| `[A-Za-z_]{30,}` | **156 ms** | 478 ms | 3.1x faster |
+| `[0-9]{5,}` | **177 ms** | 643 ms | 3.6x faster |
 
 ### Optional: the PCRE2 build
 
@@ -124,17 +162,9 @@ GB), ffs is faster than ripgrep on all 21 searches in `bench/llvm.sh`,
 work the lazy DFA can't: patterns with `\b` (`-w`), and patterns whose DFA
 would need too many states. Matching rules don't change (the same 97 compat
 checks pass), but the binary needs libpcre2-8 installed. Since the DFA,
-the two builds are within a few percent of each other (`-uu -n`):
-
-| Linux kernel source | ffs | ffs + PCRE2 | ripgrep |
-|:---|---:|---:|---:|
-| Regex with no literal `[0-9a-f]{16}` | **95 ms** | **95 ms** | 280 ms |
-| Alternation with a common word `spin_lock\|mutex_lock\|struct [a-z]+_ops` | **113 ms** | **112 ms** | 127 ms |
-| `^\s*#\s*define\s+[A-Z_]+\s+0x[0-9a-fA-F]+` | **116 ms** | 118 ms | 155 ms |
-| Regex with a literal `PM_[A-Z_]+` | **74 ms** | 78 ms | 97 ms |
-
-On the agent session above, the PCRE2 build takes **56 ms against
-ripgrep's 89 ms** (`results-linux/pcre2/agent.md`).
+the two builds are within a few percent of each other (table above). On
+the agent session, the PCRE2 build takes **56 ms against ripgrep's 89 ms**
+(`results-linux/pcre2/agent.md`).
 
 **Why ffs is fast elsewhere:** two ideas, done carefully.
 
@@ -243,14 +273,20 @@ ffs_search("src", "TODO", FFS_IGNORE_CASE, 0, on_match, NULL);
   the common punctuation and symbol blocks as not.
 - **Binary files are skipped** as soon as a NUL byte shows up (`-a` searches
   them); ripgrep prints the matches it found before the NUL.
-- **Some regexes are slower than ripgrep's**: up to 4.8× when there is no
-  fixed text in the pattern, 1.3× with the PCRE2 build (the tables above).
+- **Regexes with `\b` skip the DFA**, and PCRE2 too (ffs's `\b` sees
+  whole UTF-8 characters). They are fast when a rare literal or class run
+  picks the lines (`\b[0-9a-f]{16}\b`: 97 ms against ripgrep's 418 on the
+  kernel), but when the only literal is common the Pike VM checks most
+  lines: `\b[a-z]+_[a-z]+\b` takes 2.4 s against ripgrep's 0.65 s. The
+  same goes for the rare patterns that need too many DFA states, once the
+  DFA gives up.
 
 ## Correctness
 
 `zig build test` runs randomized tests:
-- the SIMD search against a naive reference;
-- the regex VM against a backtracking reference matcher;
+- the SIMD search, and the class-run scan, against naive references;
+- the regex VM and the lazy DFA against a backtracking reference matcher,
+  and the DFA's whole-buffer search against the VM line by line;
 - the C API, called the way C would call it.
 
 `tests/compat.sh` runs about 100 command lines through both ffs and

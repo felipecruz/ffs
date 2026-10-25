@@ -1552,8 +1552,11 @@ and that an exact run is the whole answer.
 - Regex without a literal: closed on Linux by the lazy DFA and the
   class-run scan (Experiment 17). Re-measure on the M5, where Experiment 16
   had it 1.25–2x behind.
-- `\b` in the DFA: `-w` and `\b` patterns still run on the Pike VM (or
-  PCRE2). An ASCII-only `\b` would be one byte of lookbehind in the state;
+- `\b` in the DFA: `-w` and `\b` patterns still run on the Pike VM (PCRE2
+  doesn't take them either). Where the only literal is common this is the
+  one measured loss left: `\b[a-z]+_[a-z]+\b` on the kernel, 2.4 s against
+  ripgrep's 0.65 s (`\b[0-9a-f]{16}\b` is fine, 97 ms against 418, since
+  the class run picks the lines). An ASCII-only `\b` would be one byte of lookbehind in the state;
   ffs's Unicode `\b` needs the DFA to fall back only on non-ASCII bytes.
 - A DFA skip loop: while the DFA sits in its start state, jump with SIMD to
   the next byte that can start a match (`first`), as the Pike VM does.
