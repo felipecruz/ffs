@@ -50,7 +50,11 @@ $ ffs -n -B1 -A2 'void serverLogRaw\(' src/server.c
 | `-v` | the lines that don't match (with `-c`: how many) |
 | `--json` | ripgrep's JSON Lines messages for the matching lines, for programs |
 | `--null` (`-0`) | a NUL byte after each path instead of `:`, or of the newline with `-l` |
-| `-M N` | `[Omitted long matching line]` for lines longer than N bytes |
+| `-M N` | `[Omitted long matching line]` for lines longer than N bytes (0: no limit) |
+
+As in ripgrep, `--json`, `-c`, `-l` and `--files` are one setting and the
+last one given wins: `-l --json` prints JSON, `--json -l` paths. `-o` and
+`-q` don't change it, and `-q --json` still prints the `summary` message.
 
 ```console
 $ ffs -o -N 'CVE-[0-9]{4}-[0-9]+' 00-RELEASENOTES | sort -u | tail -3

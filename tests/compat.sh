@@ -212,6 +212,28 @@ check sort --filter nul "${G[@]}" -l --null foo --iglob '*.TXT' .
 check sort -n --max-columns 5 'foo|1' c.txt a/x.txt
 check sort --filter json --json --max-columns 5 foo .
 check raw --filter json --json foo esc.txt
+check sort -n --max-columns 0 foo .
+check sort -n -M 0 -C 1 m c.txt
+# --json, -l, -c and --files are one setting: the last one given wins.
+# -o and -q don't change it, and --json still prints with -q.
+check sort --filter json -l --json foo .
+check sort --json -l foo .
+check sort --filter json -c --json foo .
+check sort --json -c foo .
+check sort --filter json --files --json foo .
+check sort --json --files
+check sort -l -o foo .
+check sort -o -l foo .
+check raw -q -l foo .
+check raw -q -c foo .
+check raw -q -o foo .
+check sort --filter json -q --json foo .
+check raw --filter json --json -q nomatch a/x.txt
+# -m: bytes_searched stops at the line where the search stopped, unless -v.
+check raw --filter json --json -m 1 foo a/x.txt
+check raw --filter json --json -m 2 foo c.txt a/x.txt
+check raw --filter json --json -m 1 -v foo a/x.txt
+check sort --filter json --json -m 1 foo .
 check sort -l foo -t md
 check sort -l foo -T md
 check sort --files -t swift

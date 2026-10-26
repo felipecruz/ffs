@@ -24,6 +24,12 @@ call rg with flags ffs didn't have.
   `-l --null`, `-c -H --null` and `--json -n`, with `--hidden`, the VCS
   directories left out and `--max-columns 500`; 124 checks in all. On the
   Linux kernel those take 75–80 ms, against ripgrep's 102–106 ms.
+- As in ripgrep: `--json`, `-c`, `-l` and `--files` are one setting, the
+  last one given wins (`-l --json` printed paths); `-o` and `-q` no longer
+  override `-l` or `-c`, and `-q --json` prints the `summary` message;
+  `-M 0` means no limit (it omitted every line); with `-m`, `bytes_searched`
+  stops at the line where the search stopped. 19 more checks in
+  `tests/compat.sh`, 143 in all.
 
 ## 0.0.9 — 2026-10-25
 

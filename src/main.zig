@@ -75,6 +75,7 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(0);
     }
 
+    cli.resolveMode();
     var positional: []const []const u8 = cli.positional.items;
     if (cli.print.mode != .files and cli.patterns.items.len == 0) {
         if (positional.len == 0) usage();
@@ -95,9 +96,6 @@ pub fn main(init: std.process.Init) !void {
 
     var print = cli.print;
     print.file = .stdout();
-    // --json only changes how matching lines are printed; with -c, -l, -q
-    // or --files it does nothing, as in rg. It numbers lines unless -N.
-    print.json = cli.json and (print.mode == .lines or print.mode == .only_matching);
     // On a terminal rg numbers lines; in a pipe only with -n.
     if (cli.line_number == null) cli.line_number = print.json or (std.Io.File.stdout().isTty(io) catch false);
     print.line_number = cli.line_number.?;
@@ -174,7 +172,12 @@ const Cli = struct {
     globs: glob.RuleSet = .{},
     types: glob.RuleSet = .{}, // -t and -T, in order
     type_list: bool = false,
-    json: bool = false,
+    // As in rg, --json, -l, -c and --files are one setting, the last one
+    // given wins; -o and -q apply to whichever it is. `resolveMode` turns
+    // them into `print.mode` and `print.json`.
+    output: Output = .lines,
+    only_matching: bool = false,
+    quiet: bool = false,
     hidden: bool = false,
     ignore: bool = true,
     vcs_ignore: bool = true,
@@ -245,11 +248,11 @@ const Cli = struct {
             .no_line_number => c.line_number = false,
             .with_filename => c.print.with_filename = true,
             .no_filename => c.print.with_filename = false,
-            .only_matching => c.print.mode = .only_matching,
-            .count => c.print.mode = .count,
-            .files_with_matches => c.print.mode = .files_with_matches,
-            .quiet => c.print.mode = .quiet,
-            .files => c.print.mode = .files,
+            .only_matching => c.only_matching = true,
+            .count => c.output = .count,
+            .files_with_matches => c.output = .files_with_matches,
+            .quiet => c.quiet = true,
+            .files => c.output = .files,
             .max_count => c.max_count = try number(v),
             .after_context => c.print.after = try number(v),
             .before_context => c.print.before = try number(v),
@@ -269,9 +272,13 @@ const Cli = struct {
                 try addType(a, &c.types, v, if (flag == .type) .include else .ignore);
             },
             .type_list => c.type_list = true,
-            .json => c.json = true,
+            .json => c.output = .json,
             .nul => c.print.null_sep = true,
-            .max_columns => c.print.max_columns = try number(v),
+            // As in rg, 0 means no limit.
+            .max_columns => c.print.max_columns = switch (try number(v)) {
+                0 => null,
+                else => |n| n,
+            },
             .hidden => c.hidden = true,
             .no_hidden => c.hidden = false,
             .no_ignore => c.ignore = false,
@@ -290,6 +297,21 @@ const Cli = struct {
             // Accepted for compatibility; ffs prints no color and no headings.
             .color, .no_heading, .heading, .no_messages => {},
         }
+    }
+
+    const Output = enum { lines, json, count, files_with_matches, files };
+
+    // -q prints nothing, except that --json still does. -o turns lines into
+    // matches, also in --json; with -l, -c or --files it does nothing.
+    fn resolveMode(c: *Cli) void {
+        c.print.json = c.output == .json;
+        c.print.summary_only = c.print.json and c.quiet;
+        c.print.mode = switch (c.output) {
+            .lines, .json => if (c.quiet and !c.print.json) .quiet else if (c.only_matching) .only_matching else .lines,
+            .count => if (c.quiet) .quiet else .count,
+            .files_with_matches => if (c.quiet) .quiet else .files_with_matches,
+            .files => .files,
+        };
     }
 
     const Term = struct { source: []const u8, regex: bool, ignore_case: bool };
@@ -534,7 +556,7 @@ const help =
     \\      --json              matching lines as ripgrep's JSON Lines messages
     \\  -0, --null              a NUL byte after each path instead of ':' or '\\n'
     \\  -M, --max-columns N     print lines longer than N bytes, newline included,
-    \\                          as "[Omitted long matching line]"
+    \\                          as "[Omitted long matching line]"; 0: no limit
     \\
     \\Files:
     \\      --files             list the files that would be searched; no PATTERN
@@ -613,7 +635,7 @@ test "command line" {
     // The flags Claude Code's Grep tool passes.
     const g = try parsed(a, &.{ "--hidden", "--glob", "!.git", "--max-columns", "500", "--json", "-n", "-tc", "-T", "make", "--iglob", "*.MD", "--null", "foo" });
     try std.testing.expectEqual(500, g.print.max_columns.?);
-    try std.testing.expect(g.json and g.print.null_sep);
+    try std.testing.expect(g.output == .json and g.print.null_sep);
     try std.testing.expect(g.types.rules.items.len > 2);
     try std.testing.expect(g.globs.rules.items[1].fold);
     var bad: Cli = .{};

@@ -141,13 +141,19 @@ Text that is not valid UTF-8 is given base64-encoded, as
 Lines are numbered unless
 .Fl N
 is given.
-With
+As in
+.Xr rg 1 ,
+.Fl -json ,
 .Fl c ,
-.Fl l ,
-.Fl q
-or
+.Fl l
+and
 .Fl -files
-this flag does nothing.
+are one setting, and the last one given wins.
+With
+.Fl q ,
+only the
+.Ql summary
+message is printed.
 .It Fl 0 , Fl -null
 Print a NUL byte after each path instead of
 .Ql \&:
@@ -163,6 +169,7 @@ bytes, its newline included, as
 .Ql [Omitted long matching line]
 (or
 .Ql [Omitted long context line] ) .
+0 means no limit.
 .It Fl -color Ns = Ns Ar when , Fl -colour Ns = Ns Ar when , Fl -heading , Fl -no-heading , Fl -no-messages
 Accepted for compatibility and ignored:
 .Nm

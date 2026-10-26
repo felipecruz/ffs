@@ -80,6 +80,8 @@ pub const Print = struct {
     /// messages, with `begin`/`end` around each file and a `summary` last.
     /// Only for `.lines` and `.only_matching`, which then print whole lines.
     json: bool = false,
+    /// `-q` with `--json`: no messages but the `summary`, as in rg.
+    summary_only: bool = false,
     /// `--null`: a NUL byte after each path instead of ':' (or '\n').
     null_sep: bool = false,
     /// `--max-columns`: lines longer than this, newline included, are
@@ -594,6 +596,8 @@ const Printer = struct {
     // `--json`: the `begin` message is out, and the numbers for `end`.
     begun: bool = false,
     file_stats: FileStats = .{},
+    // Where `-m` stopped the search: the end of the last line it counted.
+    stopped_at: ?usize = null,
 
     pub fn onLine(p: *Printer, m: match.Match) !void {
         p.count += 1;
@@ -622,7 +626,15 @@ const Printer = struct {
             },
             .lines => try p.wholeLine(m),
         }
-        if (p.s.opts.max_count) |max| if (p.count >= max) return error.Done;
+        if (p.s.opts.max_count) |max| if (p.count >= max) {
+            // As in rg, the bytes searched then end with this line; with -v
+            // they are still the whole file.
+            if (!p.s.opts.invert) {
+                const end = p.local.offset + (@intFromPtr(m.data.ptr) - @intFromPtr(p.local.buf.ptr)) + m.end + 1;
+                p.stopped_at = @min(end, p.local.read);
+            }
+            return error.Done;
+        };
     }
 
     fn wholeLine(p: *Printer, m: match.Match) !void {
@@ -641,7 +653,7 @@ const Printer = struct {
             try p.out.print("{d}\n", .{p.count});
         }
         if (p.p.json) {
-            p.file_stats.bytes_searched = p.local.read;
+            p.file_stats.bytes_searched = p.stopped_at orelse p.local.read;
             p.file_stats.matched_lines = p.count;
             p.file_stats.elapsed = elapsed;
             if (p.begun) try p.jsonEnd();
@@ -673,6 +685,17 @@ const Printer = struct {
 
     // A `match` or `context` message, after the file's `begin`.
     fn jsonLine(p: *Printer, is_match: bool, number: usize, text: []const u8, nl: bool) !void {
+        if (p.p.summary_only) {
+            if (is_match and !p.s.opts.invert) {
+                var from: usize = 0;
+                while (p.s.findSpan(p.vm, text, from)) |span| {
+                    p.file_stats.matches += 1;
+                    from = if (span.end > span.start) span.end else span.end + 1;
+                    if (from > text.len) break;
+                }
+            }
+            return;
+        }
         if (!p.begun) {
             p.begun = true;
             const jp = &p.local.json_path;
