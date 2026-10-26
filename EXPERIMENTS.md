@@ -8,7 +8,7 @@ code works see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 Environment: macOS 27.0.1, Apple M5, Homebrew.
 
-> **Experiments 1–14 and 16 run on macOS; Experiments 15 and 17 run on Linux.**
+> **Experiments 1–14, 16 and 18 run on macOS; Experiments 15 and 17 run on Linux.**
 > "Linux" in the tables below always means the *Linux kernel source tree*
 > used as a fixture (`fixtures/linux`), not the Linux operating system.
 > Conclusions about threads and system time in Experiments 1–14 and 16 are
@@ -1541,12 +1541,187 @@ right; `findLinesRun` is checked against a line-by-line reference; the
 randomized test also asserts that every matching line has the class run,
 and that an exact run is the whole answer.
 
+## Experiment 18 — LLVM: a tree that does not fit in the page cache
+
+A third, larger fixture: the [LLVM monorepo](https://github.com/llvm/llvm-project),
+shallow clone of `main` at `eddc1360d9dc066398f393c5d613afa160eeeb32`
+(2026-10-23) in `fixtures/llvm`. 3.0 GB on disk including a 360 MB `.git`,
+188,431 files, 165 of them over 1 MB (long `.ll` and `.mlir` tests). Same M5,
+tools and `main` (7256ab4) as Experiment 16; no code was changed for this
+experiment. Results in `results-macos/llvm-survey/` and
+`results-macos/llvm-pcre2/` (hyperfine 2.0 JSON, schema 2, with the exact
+commands). Medians throughout.
+
+### What the survey said
+
+14 query shapes, `ffs`, `rg -uu` and `rg -uu -j4`, 5 runs each after 1
+warm-up, whole tree (`llvm-<slug>.json`):
+
+| Query | ffs | `rg -uu` | `rg -uu -j4` | ffs user CPU |
+|:---|---:|---:|---:|---:|
+| Rare `isNoopIntrinsic` | 4,733 ms | 2,957 | 2,960 | 242 ms |
+| Common `getContext` | 4,674 | 3,340 | 3,646 | 240 |
+| No match `zqxjvkwqz` | 4,588 | 3,189 | 3,071 | 233 |
+| Long `#include "llvm/ADT/SmallVector.h"` | 4,359 | 3,542 | 3,788 | 227 |
+| `-i getcontext` | 4,651 | 3,516 | 5,041 | 265 |
+| `-w Value` | 4,657 | 3,307 | 3,729 | 367 |
+| `LLVM_[A-Z_]+` | 4,657 | 3,266 | 4,031 | 248 |
+| `\w+Pass\b` | 4,698 | 3,424 | 3,870 | 266 |
+| `(Sema\|Parser)::Act` | 4,665 | 3,207 | 3,521 | 238 |
+| `-i todo\|fixme` | 4,727 | 3,426 | 3,664 | 444 |
+| `[0-9a-f]{16}` | 7,210 | 3,195 | 5,397 | 9,882 |
+| `^\s*#\s*define\s+[A-Z_]+\s+0x[0-9a-fA-F]+` | 4,672 | 3,491 | 3,399 | 304 |
+| `-c getContext` | 4,679 | 3,427 | 3,322 | 243 |
+| `-l getContext` | 4,697 | 4,244 | 3,278 | 237 |
+
+The first macOS result where ripgrep wins nearly everything, including at
+the same thread count. But the shape says it is not the search: ffs takes
+~4.6 s **whatever the pattern**, with 230–440 ms of user CPU, and its system
+CPU (6.2 s) is the same as `rg -j4`'s (6.0 s). Same work, more wall time:
+ffs's four workers are waiting on something.
+
+### Not the walk
+
+`--files`, which walks and lists without opening a file
+(`llvm-walk.json`): ffs 676 ms, `rg -uu -j4` 652 ms; on the kernel tree ffs
+188 ms, ripgrep 232 ms. The walk is not where 1.5 s goes.
+
+### It is the page cache
+
+Pages read in from disk during one search (`vm_stat` Pageins before and
+after): 10,000–38,000 pages of 16 KiB, **160–600 MB per run, for both
+tools**. On the kernel tree, Experiment 16, a warm run reads nothing. This
+Mac has 24 GiB, but at the time ~18.5 GiB of application memory sat in the
+compressor (a video call, browsers, mail) and file-backed pages were
+292,303, about **4.5 GiB for every cached file on the system**. LLVM
+(3.0 GB) next to the kernel tree (2.0 GB) does not fit, so every run starts
+with part of LLVM evicted and pays for it at SSD speed.
+
+Two consequences:
+
+- **The survey's order was unfair.** hyperfine runs all of one command's
+  runs, then the next command's; with a cache that holds most but not all of
+  the tree, what ran before decides how much is left. Alternating the tools
+  every run (`alternating-rare.json`, 8 rounds, order reversed every round)
+  shrinks the gap from 1.6x to **1.23x**: ffs 4.28 s, `rg -j4` 3.47, `rg`
+  3.58, with about the same page-ins (19,600, 20,900, 26,300). A later set
+  of 5 alternating pairs, with the machine quieter, was 3.29 against 3.01 s
+  (1.09x), and ffs won two of the five (not saved; `/usr/bin/time -l`).
+- **Where it all fits, it is a tie again** (`llvm-cached-subtree.json`, 10
+  runs after 3 warm-ups):
+
+| Subtree | ffs | `rg -uu -j4` | `rg -uu` |
+|:---|---:|---:|---:|
+| `llvm/` (1.5 GB), `isNoopIntrinsic` | 776 ms | **767** | 1,796 |
+| `clang/` (477 MB), `getContext` | **322** | 333 | — |
+
+That is the Experiment 16 result exactly: even with `rg -j4`, 2.3x ahead of
+ripgrep's default.
+
+### What is left: ffs pays more for a cold tree at `-j4`
+
+Even alternating, ffs at 4 threads is slower than ripgrep at 4 threads on
+the whole tree. What was looked at:
+
+- **Time per file.** A throwaway build logged open/search/close time for
+  every file. 99.9% of files take under 0.5 ms and no file over 2.5 ms;
+  there is no slow outlier, the time is spread over everything. Between
+  runs of the *same binary*, the thread time spent in `llvm/` alone went
+  from 1.9 to 8.3 s: how cold the cache is decides it.
+- **Where threads block.** `sample`, 2 s mid-run, top of stack: ffs
+  `readv` 3,156, `openat` 792, `__ulock_wait2` 1,015 (the idle main
+  thread); ripgrep `read` 1,893, `open` 1,927, `__ulock_wait` 1,002. Both
+  have four threads blocked in the kernel nearly all the time; ffs waits on
+  file data, ripgrep about equally on opening and reading.
+- **Context switches.** For both tools, wall time follows voluntary context
+  switches (each a thread blocking) on the same line, about 2.2 s plus
+  ~10 µs per switch. The cost of a miss is the same; ffs's slow runs are the
+  ones with more misses.
+- **Not read size.** A build with 64 KiB reads, ripgrep's buffer size
+  instead of 256 KiB (in case ffs waited for 4x more of each cold binary
+  file before seeing its NUL), was no better: 4.78 against 4.68 s
+  (`alternating-64k.json`).
+- **Not `.git`.** Without hidden files (`-u --no-ignore`, 187,156 files):
+  ffs 4.44 s, `rg -j4` 4.07, `rg` 3.73 (`alternating-nohidden.json`).
+- **Not thread count, as such.** Both run 4 workers plus a main thread
+  (`ps -M` mid-run).
+
+But more threads do help ffs here (`alternating-threads.json`, 5 rounds):
+
+| | ffs `-j4` | ffs `-j6` | ffs `-j8` | ffs `-j10` | `rg -j4` | `rg -j8` |
+|:---|---:|---:|---:|---:|---:|---:|
+| Whole tree, `isNoopIntrinsic` | 4,680 ms | 3,340 | **3,090** | 3,350 | 3,260 | **3,000** |
+
+With part of the tree on the SSD, more reads in flight is worth more than
+the kernel contention that makes 4 threads best on a cached tree
+(Experiment 12): ffs `-j8` matches `rg -j8`. Why ripgrep gets nearly that
+much out of 4 threads and ffs does not is **not explained**. The candidate
+left is the order of reads: ffs's workers take the deepest queued directory
+and visit its files while reading it, so the four stay close together in the
+tree; ripgrep reads a directory whole and its workers steal from each
+other's stacks, so they spread out. That would change which files are still
+cached when each one gets there. Untested.
+
+### Regex, and PCRE2
+
+The one row above that is not I/O: `[0-9a-f]{16}`, with 9.9 s of user CPU
+against ripgrep's 3.5. To compare engines without the cache in the way,
+`clang/` (cached), `zig build -Dpcre2=true` against Homebrew's PCRE2, 10
+runs after 3 warm-ups (`results-macos/llvm-pcre2/`); all three engines gave
+the same match counts on every pattern:
+
+| Pattern | ffs | ffs + PCRE2 | `rg -j4` | `rg` | `rg -P -j4` |
+|:---|---:|---:|---:|---:|---:|
+| `getContext` (literal) | **309 ms** | 330 | 320 | 559 | 344 |
+| `LLVM_[A-Z_]+` | **302** | 309 | 336 | 732 | 370 |
+| `(Sema\|Parser)::Act` | **320** | **320** | 331 | 652 | 383 |
+| `-i todo\|fixme` | **324** | 326 | 337 | 535 | 399 |
+| `^\s*#\s*define\s+[A-Z_]+\s+0x[0-9a-fA-F]+` | **314** | 318 | 321 | 539 | 341 |
+| `\w+Pass\b` | 385 | 333 | **328** | 541 | 453 |
+| `[0-9a-f]{16}` | 674 | **391** | 398 | 498 | 411 |
+
+- **The only engine loss is a pattern with no literal**, and PCRE2's JIT
+  closes it: 674 → 391 ms, user CPU 1.6 s → 0.49 s, a tie with `rg -j4`.
+  `\w+Pass\b` too (385 → 333): its literal `Pass` is common, so the VM sees
+  many candidate lines.
+- Everywhere else PCRE2 changes nothing, because the SIMD prefilter does
+  the work and the VM barely runs. ffs is level with or ahead of `rg -j4` on
+  all of them.
+- The `#define` pattern, 1.25x behind on the kernel tree (Experiment 16),
+  ties here: LLVM has few `#define … 0x` lines, so few candidates.
+
+### Conclusion
+
+ripgrep wins on LLVM on this Mac because **the tree does not fit in the
+memory left for the file cache**, and every run reads hundreds of MB from
+the SSD. Cached, it is the kernel-tree result again: ffs ties `rg -j4` on
+everything with a literal. What is real:
+
+1. On a cold tree ffs at its default 4 threads loses 10–25% to ripgrep at 4;
+   at 8 threads it ties. `-j auto` is tuned for cached trees.
+2. A regex with no literal is 1.7x behind in ffs's VM; `-Dpcre2=true`
+   closes it.
+
+### Caveats
+
+- The cache state is set by everything else on the machine, which was not
+  controlled: there was no `sudo purge` for a truly cold start, and no way to
+  give LLVM the whole cache. Absolute times on the whole tree moved from 2.8
+  to 4.8 s for the same binary.
+- The survey's ordering bias (above) applies to its whole table; only the
+  alternating runs and the cached subtrees compare the tools fairly.
+- One Mac, APFS on the internal SSD. Not run on Linux.
+
 ## Next steps
 
 - Run on more machines: `bench/threads.sh` on another Mac (does `-j auto`
   land on the best `-j`? see Experiment 12; Experiment 16 confirms it again
   on the M5 with the new walk). Linux is covered by Experiment 15, on one
   16-thread box.
+- Trees bigger than the page cache (Experiment 18): find why ffs at `-j4`
+  blocks more than `rg -j4` (walk order is the candidate), and whether
+  `-j auto` should go wider when reads miss the cache. Needs a repeatable
+  cold start (`sudo purge`) to measure.
 - Case-sensitive matcher on x86: 1.4–1.7x slower than `-i` on the Ryzen,
   2–40% faster on the M5 (Experiment 16). Look at what the AVX2 build emits.
 - Regex without a literal: closed on Linux by the lazy DFA and the
