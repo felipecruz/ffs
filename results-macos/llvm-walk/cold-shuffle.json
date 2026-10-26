@@ -1,0 +1,108 @@
+{
+ "pct_evicted": 100,
+ "commands": {
+  "ffs -j4 lifo": [
+   "/private/tmp/claude-501/-Users-felipecruz-Projects-personal-ffs/549d0277-c3d4-4414-b55b-99be469a3915/scratchpad/walkexp/zig-out/release/ffs",
+   "-j4",
+   "-uu",
+   "-n",
+   "-F",
+   "-e",
+   "isNoopIntrinsic",
+   "/Users/felipecruz/Projects/personal/ffs/fixtures/llvm"
+  ],
+  "ffs -j4 shuffle": [
+   "/private/tmp/claude-501/-Users-felipecruz-Projects-personal-ffs/549d0277-c3d4-4414-b55b-99be469a3915/scratchpad/walkexp/zig-out/release/ffs",
+   "-j4",
+   "-uu",
+   "-n",
+   "-F",
+   "-e",
+   "isNoopIntrinsic",
+   "/Users/felipecruz/Projects/personal/ffs/fixtures/llvm"
+  ],
+  "rg -j4": [
+   "/opt/homebrew/bin/rg",
+   "-j4",
+   "-uu",
+   "-n",
+   "-F",
+   "-e",
+   "isNoopIntrinsic",
+   "/Users/felipecruz/Projects/personal/ffs/fixtures/llvm"
+  ]
+ },
+ "env": {
+  "ffs -j4 lifo": "lifo",
+  "ffs -j4 shuffle": "shuffle",
+  "rg -j4": null
+ },
+ "runs": {
+  "ffs -j4 lifo": [
+   [
+    4.486587333958596,
+    22253
+   ],
+   [
+    4.441993250045925,
+    23979
+   ],
+   [
+    4.422695624874905,
+    24104
+   ],
+   [
+    4.422581166960299,
+    23169
+   ],
+   [
+    4.46895012492314,
+    24066
+   ]
+  ],
+  "ffs -j4 shuffle": [
+   [
+    4.51637624995783,
+    24137
+   ],
+   [
+    4.52435191697441,
+    35418
+   ],
+   [
+    4.513088000006974,
+    23449
+   ],
+   [
+    4.478103582980111,
+    22695
+   ],
+   [
+    4.4515071250498295,
+    21444
+   ]
+  ],
+  "rg -j4": [
+   [
+    4.936029457952827,
+    37029
+   ],
+   [
+    4.876213665818796,
+    36464
+   ],
+   [
+    4.947239208035171,
+    37450
+   ],
+   [
+    4.852865125052631,
+    33014
+   ],
+   [
+    4.913583041867241,
+    38315
+   ]
+  ]
+ }
+}

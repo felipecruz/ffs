@@ -1,0 +1,305 @@
+{
+ "pct_evicted": 0,
+ "commands": {
+  "ffs -j4 lifo": [
+   "/private/tmp/claude-501/-Users-felipecruz-Projects-personal-ffs/549d0277-c3d4-4414-b55b-99be469a3915/scratchpad/walkexp/zig-out/release/ffs",
+   "-j4",
+   "-uu",
+   "-n",
+   "-F",
+   "-e",
+   "isNoopIntrinsic",
+   "/Users/felipecruz/Projects/personal/ffs/fixtures/llvm"
+  ],
+  "ffs -j4 fifo": [
+   "/private/tmp/claude-501/-Users-felipecruz-Projects-personal-ffs/549d0277-c3d4-4414-b55b-99be469a3915/scratchpad/walkexp/zig-out/release/ffs",
+   "-j4",
+   "-uu",
+   "-n",
+   "-F",
+   "-e",
+   "isNoopIntrinsic",
+   "/Users/felipecruz/Projects/personal/ffs/fixtures/llvm"
+  ],
+  "ffs -j4 steal": [
+   "/private/tmp/claude-501/-Users-felipecruz-Projects-personal-ffs/549d0277-c3d4-4414-b55b-99be469a3915/scratchpad/walkexp/zig-out/release/ffs",
+   "-j4",
+   "-uu",
+   "-n",
+   "-F",
+   "-e",
+   "isNoopIntrinsic",
+   "/Users/felipecruz/Projects/personal/ffs/fixtures/llvm"
+  ],
+  "ffs -j4 lifo,dirfirst": [
+   "/private/tmp/claude-501/-Users-felipecruz-Projects-personal-ffs/549d0277-c3d4-4414-b55b-99be469a3915/scratchpad/walkexp/zig-out/release/ffs",
+   "-j4",
+   "-uu",
+   "-n",
+   "-F",
+   "-e",
+   "isNoopIntrinsic",
+   "/Users/felipecruz/Projects/personal/ffs/fixtures/llvm"
+  ],
+  "ffs -j4 steal,dirfirst": [
+   "/private/tmp/claude-501/-Users-felipecruz-Projects-personal-ffs/549d0277-c3d4-4414-b55b-99be469a3915/scratchpad/walkexp/zig-out/release/ffs",
+   "-j4",
+   "-uu",
+   "-n",
+   "-F",
+   "-e",
+   "isNoopIntrinsic",
+   "/Users/felipecruz/Projects/personal/ffs/fixtures/llvm"
+  ],
+  "rg -j4": [
+   "/opt/homebrew/bin/rg",
+   "-j4",
+   "-uu",
+   "-n",
+   "-F",
+   "-e",
+   "isNoopIntrinsic",
+   "/Users/felipecruz/Projects/personal/ffs/fixtures/llvm"
+  ],
+  "ffs -j8 lifo": [
+   "/private/tmp/claude-501/-Users-felipecruz-Projects-personal-ffs/549d0277-c3d4-4414-b55b-99be469a3915/scratchpad/walkexp/zig-out/release/ffs",
+   "-j8",
+   "-uu",
+   "-n",
+   "-F",
+   "-e",
+   "isNoopIntrinsic",
+   "/Users/felipecruz/Projects/personal/ffs/fixtures/llvm"
+  ],
+  "rg -j8": [
+   "/opt/homebrew/bin/rg",
+   "-j8",
+   "-uu",
+   "-n",
+   "-F",
+   "-e",
+   "isNoopIntrinsic",
+   "/Users/felipecruz/Projects/personal/ffs/fixtures/llvm"
+  ]
+ },
+ "env": {
+  "ffs -j4 lifo": "lifo",
+  "ffs -j4 fifo": "fifo",
+  "ffs -j4 steal": "steal",
+  "ffs -j4 lifo,dirfirst": "lifo,dirfirst",
+  "ffs -j4 steal,dirfirst": "steal,dirfirst",
+  "rg -j4": null,
+  "ffs -j8 lifo": "lifo",
+  "rg -j8": null
+ },
+ "runs": {
+  "ffs -j4 lifo": [
+   [
+    4.280155790969729,
+    25580
+   ],
+   [
+    2.5858582919463515,
+    9157
+   ],
+   [
+    4.549951625056565,
+    20393
+   ],
+   [
+    2.5690222079865634,
+    9042
+   ],
+   [
+    4.700757041107863,
+    21131
+   ],
+   [
+    2.7213807909283787,
+    9494
+   ]
+  ],
+  "ffs -j4 fifo": [
+   [
+    3.2051015000324696,
+    8265
+   ],
+   [
+    2.828920542029664,
+    9532
+   ],
+   [
+    2.8434530841186643,
+    8990
+   ],
+   [
+    2.8553420410025865,
+    9506
+   ],
+   [
+    3.020590875064954,
+    8104
+   ],
+   [
+    3.472191708860919,
+    10920
+   ]
+  ],
+  "ffs -j4 steal": [
+   [
+    3.3202849170193076,
+    19976
+   ],
+   [
+    2.6106679160147905,
+    11109
+   ],
+   [
+    2.8858872919809073,
+    11270
+   ],
+   [
+    2.6445807081181556,
+    9634
+   ],
+   [
+    2.82568879192695,
+    11495
+   ],
+   [
+    2.9223294591065496,
+    13476
+   ]
+  ],
+  "ffs -j4 lifo,dirfirst": [
+   [
+    3.0880401670001447,
+    11909
+   ],
+   [
+    2.846755916951224,
+    9839
+   ],
+   [
+    2.566752874990925,
+    9448
+   ],
+   [
+    2.5999613341409713,
+    8725
+   ],
+   [
+    2.5140338751953095,
+    8396
+   ],
+   [
+    2.896702375030145,
+    11971
+   ]
+  ],
+  "ffs -j4 steal,dirfirst": [
+   [
+    2.8065599999390543,
+    13529
+   ],
+   [
+    3.175606583012268,
+    17504
+   ],
+   [
+    2.758959624916315,
+    12331
+   ],
+   [
+    3.6328770420514047,
+    13965
+   ],
+   [
+    3.0488337920978665,
+    23758
+   ],
+   [
+    2.9621942499652505,
+    11742
+   ]
+  ],
+  "rg -j4": [
+   [
+    2.6051307080779225,
+    12136
+   ],
+   [
+    3.1046784999780357,
+    19487
+   ],
+   [
+    2.324224666925147,
+    8903
+   ],
+   [
+    3.2657914580777287,
+    22924
+   ],
+   [
+    3.1983602920081466,
+    13812
+   ],
+   [
+    3.745443166932091,
+    23153
+   ]
+  ],
+  "ffs -j8 lifo": [
+   [
+    3.0905690831132233,
+    9495
+   ],
+   [
+    3.199114916846156,
+    9864
+   ],
+   [
+    3.0104071248788387,
+    8560
+   ],
+   [
+    3.3009274159558117,
+    9807
+   ],
+   [
+    2.9258606671355665,
+    15114
+   ],
+   [
+    3.5026499580126256,
+    7236
+   ]
+  ],
+  "rg -j8": [
+   [
+    3.2666212080512196,
+    22738
+   ],
+   [
+    2.92826733388938,
+    15071
+   ],
+   [
+    2.7975890000816435,
+    22755
+   ],
+   [
+    2.709632750134915,
+    28945
+   ],
+   [
+    2.996823334135115,
+    24473
+   ],
+   [
+    3.375267499824986,
+    7540
+   ]
+  ]
+ }
+}

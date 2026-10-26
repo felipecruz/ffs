@@ -1,0 +1,175 @@
+diff --git a/src/walk.zig b/src/walk.zig
+index 212bcdb..86e4e30 100644
+--- a/src/walk.zig
++++ b/src/walk.zig
+@@ -38,6 +38,27 @@ const glob = @import("glob.zig");
+ /// files still spreads over the workers.
+ pub const batch_len = 32;
+ 
++// EXPERIMENT: FFS_WALK = lifo (default) | fifo | steal, plus ",dirfirst".
++const Order = enum { lifo, fifo, steal };
++var order: Order = .lifo;
++var dirfirst = false;
++var shuffle = false;
++var seed: u64 = 0;
++threadlocal var wid: usize = 0;
++fn readMode() void {
++    const v = std.mem.span(std.c.getenv("FFS_WALK") orelse return);
++    if (std.mem.indexOf(u8, v, "fifo") != null) order = .fifo;
++    if (std.mem.indexOf(u8, v, "steal") != null) order = .steal;
++    if (std.mem.indexOf(u8, v, "dirfirst") != null) dirfirst = true;
++    if (std.mem.indexOf(u8, v, "shuffle") != null) {
++        shuffle = true;
++        dirfirst = true;
++        var ts: std.c.timespec = undefined;
++        _ = std.c.clock_gettime(.REALTIME, &ts);
++        seed = @bitCast(@as(i64, ts.nsec) ^ (@as(i64, ts.sec) << 20));
++    }
++}
++
+ pub const File = struct {
+     /// Open handle of the directory containing the file.
+     dir: Io.Dir,
+@@ -88,13 +109,16 @@ pub fn walk(io: Io, gpa: std.mem.Allocator, root: Io.Dir, visitor: anytype, jobs
+     var w: W = .{ .io = io, .gpa = gpa, .root = root, .visitor = visitor, .filter = filter, .arena = .init(gpa) };
+     defer w.deinit();
+ 
++    readMode();
++    w.stacks = try gpa.alloc(std.ArrayList(W.Item), @max(jobs, 1));
++    for (w.stacks) |*st| st.* = .empty;
+     var top: Dir = .{ .rel = "" }; // the root; the only item whose path is not owned
+     if (filter.ignore_files) try w.loadAncestors(&top);
+     try w.push(.{ .dir = top });
+ 
+     var group: Io.Group = .init;
+     defer group.cancel(io);
+-    for (0..@max(jobs, 1)) |_| group.async(io, W.work, .{&w});
++    for (0..@max(jobs, 1)) |i| group.async(io, W.work, .{ &w, i });
+     try group.await(io);
+     if (w.err) |err| return err;
+ }
+@@ -120,6 +144,9 @@ fn Walker(comptime Visitor: type) type {
+         /// Queued work, taken from the end: deepest directory first, which
+         /// keeps the queue short.
+         items: std.ArrayList(Item) = .empty,
++        head: usize = 0, // fifo
++        stacks: []std.ArrayList(Item) = &.{}, // steal
++        queued: usize = 0,
+         /// Items queued but not yet finished. Zero means the walk is over.
+         pending: usize = 0,
+         /// Workers waiting in `next`. Read without the mutex, so only a hint:
+@@ -137,8 +164,13 @@ fn Walker(comptime Visitor: type) type {
+         };
+ 
+         fn deinit(w: *Self) void {
+-            for (w.items.items) |item| w.freeItem(item);
++            for (w.items.items[w.head..]) |item| w.freeItem(item);
+             w.items.deinit(w.gpa);
++            for (w.stacks) |*st| {
++                for (st.items) |item| w.freeItem(item);
++                st.deinit(w.gpa);
++            }
++            w.gpa.free(w.stacks);
+             w.arena.deinit();
+         }
+ 
+@@ -160,7 +192,8 @@ fn Walker(comptime Visitor: type) type {
+         fn push(w: *Self, item: Item) !void {
+             w.mutex.lockUncancelable(w.io);
+             defer w.mutex.unlock(w.io);
+-            try w.items.append(w.gpa, item);
++            if (order == .steal) try w.stacks[wid].append(w.gpa, item) else try w.items.append(w.gpa, item);
++            w.queued += 1;
+             w.pending += 1;
+             w.ready.signal(w.io);
+         }
+@@ -169,13 +202,34 @@ fn Walker(comptime Visitor: type) type {
+         fn next(w: *Self) Io.Cancelable!?Item {
+             w.mutex.lockUncancelable(w.io);
+             defer w.mutex.unlock(w.io);
+-            while (w.items.items.len == 0 or w.err != null) {
++            while (w.queued == 0 or w.err != null) {
+                 if (w.pending == 0 or w.err != null) return null;
+                 _ = w.idle.fetchAdd(1, .monotonic);
+                 defer _ = w.idle.fetchSub(1, .monotonic);
+                 try w.ready.wait(w.io, &w.mutex); // returns holding the mutex
+             }
+-            return w.items.pop();
++            w.queued -= 1;
++            switch (order) {
++                .lifo => return w.items.pop(),
++                .fifo => {
++                    const item = w.items.items[w.head];
++                    w.head += 1;
++                    if (w.head == w.items.items.len) {
++                        w.items.clearRetainingCapacity();
++                        w.head = 0;
++                    }
++                    return item;
++                },
++                .steal => {
++                    if (w.stacks[wid].pop()) |item| return item;
++                    // Steal the oldest (shallowest) item of the next worker that has one.
++                    for (1..w.stacks.len) |k| {
++                        const v = &w.stacks[(wid + k) % w.stacks.len];
++                        if (v.items.len > 0) return v.orderedRemove(0);
++                    }
++                    unreachable;
++                },
++            }
+         }
+ 
+         fn finish(w: *Self) void {
+@@ -195,7 +249,8 @@ fn Walker(comptime Visitor: type) type {
+         }
+ 
+         // One worker: its own `Local`, then items until the queue runs dry.
+-        fn work(w: *Self) Io.Cancelable!void {
++        fn work(w: *Self, id: usize) Io.Cancelable!void {
++            wid = id;
+             var local = w.visitor.initLocal() catch |err| return w.fail(err);
+             defer w.visitor.deinitLocal(&local);
+ 
+@@ -242,6 +297,10 @@ fn Walker(comptime Visitor: type) type {
+             var glob_path: std.ArrayList(u8) = .empty; // "<glob_prefix>/<rel>/<name>"
+             defer glob_path.deinit(w.gpa);
+ 
++            var later: std.ArrayList([]const u8) = .empty; // dirfirst
++            defer w.freeNames(&later);
++            var subdirs: std.ArrayList([]const u8) = .empty; // shuffle
++            defer w.freeNames(&subdirs);
+             var it = dir.iterate();
+             while (it.next(w.io) catch return) |entry| {
+                 if (entry.kind != .directory and entry.kind != .file) continue;
+@@ -272,8 +331,10 @@ fn Walker(comptime Visitor: type) type {
+                     if (!included and !w.filter.hidden and entry.name[0] == '.') continue;
+                 }
+                 switch (entry.kind) {
+-                    .directory => try w.pushDir(sub, rel, entry.name),
+-                    .file => if (w.idle.load(.monotonic) > 0) {
++                    .directory => if (shuffle) try subdirs.append(w.gpa, try w.gpa.dupe(u8, entry.name)) else try w.pushDir(sub, rel, entry.name),
++                    .file => if (dirfirst) {
++                        try later.append(w.gpa, try w.gpa.dupe(u8, entry.name));
++                    } else if (w.idle.load(.monotonic) > 0) {
+                         try handoff.append(w.gpa, try w.gpa.dupe(u8, entry.name));
+                         if (handoff.items.len >= batch_len) try w.pushFiles(rel, &handoff);
+                     } else {
+@@ -282,6 +343,18 @@ fn Walker(comptime Visitor: type) type {
+                     else => {},
+                 }
+             }
++            if (shuffle) {
++                var prng = std.Random.DefaultPrng.init(seed ^ std.hash.Wyhash.hash(0, rel));
++                prng.random().shuffle([]const u8, subdirs.items);
++                prng.random().shuffle([]const u8, later.items);
++                for (subdirs.items) |name| try w.pushDir(sub, rel, name);
++            }
++            for (later.items) |name| {
++                if (w.idle.load(.monotonic) > 0) {
++                    try handoff.append(w.gpa, try w.gpa.dupe(u8, name));
++                    if (handoff.items.len >= batch_len) try w.pushFiles(rel, &handoff);
++                } else try w.visitOne(local, dir, rel, &path, name);
++            }
+             if (handoff.items.len > 0) try w.pushFiles(rel, &handoff);
+         }
+ 

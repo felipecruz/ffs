@@ -8,7 +8,7 @@ code works see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 Environment: macOS 27.0.1, Apple M5, Homebrew.
 
-> **Experiments 1–14, 16 and 18 run on macOS; Experiments 15 and 17 run on Linux.**
+> **Experiments 1–14, 16, 18 and 19 run on macOS; Experiments 15 and 17 run on Linux.**
 > "Linux" in the tables below always means the *Linux kernel source tree*
 > used as a fixture (`fixtures/linux`), not the Linux operating system.
 > Conclusions about threads and system time in Experiments 1–14 and 16 are
@@ -1712,26 +1712,157 @@ everything with a literal. What is real:
   alternating runs and the cached subtrees compare the tools fairly.
 - One Mac, APFS on the internal SSD. Not run on Linux.
 
+## Experiment 19 — LLVM again: the DFA on the M5, and why a big tree runs cold
+
+Same M5 and fixture as Experiment 18, two questions it left open.
+
+### The lazy DFA on the M5
+
+Experiment 18 ran 7256ab4, before the lazy DFA and the class-run scan of
+Experiment 17. The same `clang/` set (cached, 10 runs after 3 warm-ups),
+7256ab4 against `main` (dd71234), `main` with `-Dpcre2=true`, and `rg -uu
+-j4`, plus the `\b` pattern from Next steps; all four gave the same lines on
+every pattern (`results-macos/llvm-dfa/`). Median wall time, ms:
+
+| Pattern | ffs 7256ab4 | ffs `main` | `main` + PCRE2 | `rg -j4` |
+|:---|---:|---:|---:|---:|
+| `getContext` (literal) | 301 | 303 | 302 | 308 |
+| `LLVM_[A-Z_]+` | 302 | 303 | 305 | 317 |
+| `(Sema\|Parser)::Act` | 316 | 306 | 308 | 320 |
+| `-i todo\|fixme` | 311 | 309 | 310 | 328 |
+| `^\s*#\s*define\s+[A-Z_]+\s+0x[0-9a-fA-F]+` | 320 | 352 | 367 | 317 |
+| `\w+Pass\b` | 304 | 304 | 306 | 308 |
+| `[0-9a-f]{16}` | 620 | **310** | 311 | 379 |
+| `\b[a-z]+_[a-z]+\b` | 619 | 618 | 619 | **453** |
+
+- **`[0-9a-f]{16}` is closed**: 620 → 310 ms, user CPU 1.53 s → 0.11 s,
+  ahead of `rg -j4` (541 ms of user CPU) and level with PCRE2. The DFA
+  makes the PCRE2 build unnecessary on this machine.
+- The `#define` row is noise: 30 runs each (`clang-define-30runs.json`) give
+  medians of 301 and 302 ms and the same user CPU; `main` had a few slow
+  outliers.
+- `\w+Pass\b` is 304 ms on both builds, not Experiment 18's 385: that
+  difference was the machine, not the code.
+- `\b` is the loss left, 1.37x here (Next steps).
+
+### A repeatable cold start
+
+`results-macos/llvm-walk/evict.c` drops a tree's files from the page cache
+without `sudo`: map each file and `msync(MS_INVALIDATE)`, as `vmtouch -e`
+does on macOS, and `mincore` to check. After it, `clang/` is 0% resident and
+a search takes 0.84 s instead of 0.30. Directory metadata stays cached (the
+tool walks the tree to find the files), so "cold" here means cold file data.
+
+### Walk order does not matter cold
+
+To test Experiment 18's candidate, a throwaway build
+(`walk-variants.diff`) picks the walk order from `FFS_WALK`: `lifo` (today:
+one shared stack, deepest directory first), `fifo` (breadth first), `steal`
+(a stack per worker, an idle one steals the oldest item of another, as
+ripgrep does), and `dirfirst` (read the whole directory before visiting its
+files, as ripgrep does). All give the same matches and file count.
+Whole tree evicted before every run, commands alternating, 6 rounds,
+`-uu -n -F isNoopIntrinsic` (`cold-all.json`):
+
+| | `lifo` | `fifo` | `steal` | `lifo,dirfirst` | `steal,dirfirst` | `rg -j4` |
+|:---|---:|---:|---:|---:|---:|---:|
+| `-j4`, median | 4.45 s | 4.52 | 4.48 | 4.50 | 4.46 | 4.93 |
+
+`-j8`: ffs 2.72 s, `rg -j8` 2.86. Spreads under 0.1 s. Fully cold, the
+order makes no difference, and **ffs is ahead of ripgrep** at both thread
+counts. Experiment 18's loss is not about cold reads.
+
+### It is the same order every run
+
+Experiment 18's runs were never fully cold: the tree is bigger than the
+cache, and right after a full read 55% of it was resident. With no
+eviction, each command run 4 times back to back (first run dropped), two
+passes in opposite order (`self-all.json`):
+
+| | after another command (run 0) | after itself (runs 1–3, median) | page-ins |
+|:---|---:|---:|---:|
+| ffs `lifo` (today) | 3.1–4.6 s | **4.75 s** | 23,180 |
+| ffs `fifo` | 3.0–6.5 | 4.77 | 22,420 |
+| ffs `steal` | 2.6–3.0 | 3.74 | 19,532 |
+| ffs `lifo,dirfirst` | 2.5–2.9 | 4.65 | 22,814 |
+| `rg -j4` | 3.2–3.4 | **3.17** | 12,632 |
+
+After itself, ffs is as slow as fully cold (4.45 s). Every ffs order is
+deterministic, so each run reads the tree in the order the last run did, and
+an LRU cache smaller than the tree has, at every point, just evicted what
+comes next: the textbook worst case for a repeated scan. ripgrep's order
+differs from run to run (its workers steal from each other at random
+moments), so about half its reads hit. `steal` is the least deterministic
+of the ffs orders and the least bad. hyperfine runs one command's runs back
+to back, which is why Experiment 18's survey had ffs at ~4.6 s **whatever
+the pattern**, and why alternating the tools shrank the gap.
+
+### The fix: a different order every run
+
+`shuffle` reads a directory whole, shuffles its subdirectories and its files
+with a seed taken from the clock (mixed with the directory's path), then
+pushes and visits them. Same matches, a different order every run
+(`self-shuffle.json`, `cold-shuffle.json`, `cached-*.json`):
+
+| | ffs `lifo` | ffs `shuffle` | `rg -j4` |
+|:---|---:|---:|---:|
+| Whole tree, after itself | 4.38 s | **2.22** | 2.51 |
+| page-ins | 18,082 | **2,406** | 7,921 |
+| Whole tree, fully cold | **4.44 s** | 4.51 | 4.91 |
+| Kernel tree, cached, `EXPORT_SYMBOL` | 849 ms | **811** | — |
+| Kernel tree, cached, no match | 809 | 802 | — |
+| `clang/`, cached, `getContext` | 317 | **300** | — |
+| Redis, cached, no match | 12 | 12 | — |
+
+(The machine was quieter for this table than for the ones above, so its
+"after itself" times are lower across the board; compare within it.)
+
+- **Searched again right after itself, `shuffle` is 2x faster than today's walk**
+  and ahead of `rg -j4`, with a third of ripgrep's page-ins.
+- Fully cold it costs 1.5%; cached, it is level or 2–5% faster (reading the
+  directory whole before visiting its files seems to be the gain).
+- No contract changes: output order is already documented as not fixed
+  (`docs/output.md`), and `--sort` goes to ripgrep. Only `-j1`, "exactly
+  depth-first" in `src/walk.zig`, stops being reproducible.
+
+### Conclusion
+
+1. The lazy DFA closes the literal-free regex gap on the M5 too;
+   `\b` is the one regex loss left.
+2. Experiment 18's "ffs blocks more on a cold tree" was ffs reading a tree
+   bigger than the cache in the same order every run. A random order per run
+   fixes it and costs nothing measurable elsewhere. More threads (`-j8`) help
+   both tools cold, but ffs at `-j4` already beats `rg -j4` there, so
+   `-j auto` does not need a cold-tree rule.
+
+### Caveats
+
+- One Mac. The cache size is set by the rest of the machine (here ~4.4 GiB
+  file-backed, 55% of LLVM after a full read); with more free memory the tree
+  fits and none of this shows.
+- `shuffle` is a throwaway build behind an environment variable, not in
+  `main`. Its `-j1` order is random too, which a real version might keep
+  fixed.
+- Eviction leaves directory metadata cached, so "fully cold" is not a boot
+  cold start.
+
 ## Next steps
 
 - Run on more machines: `bench/threads.sh` on another Mac (does `-j auto`
   land on the best `-j`? see Experiment 12; Experiment 16 confirms it again
   on the M5 with the new walk). Linux is covered by Experiment 15, on one
   16-thread box.
-- Trees bigger than the page cache (Experiment 18): find why ffs at `-j4`
-  blocks more than `rg -j4` (walk order is the candidate), and whether
-  `-j auto` should go wider when reads miss the cache. Needs a repeatable
-  cold start (`sudo purge`) to measure.
+- Shuffle the walk order per run (Experiment 19): put `shuffle` into the
+  walker for real, without the environment variable, and decide whether
+  `-j1` keeps a fixed order. Re-run Experiment 18's survey with it.
 - Case-sensitive matcher on x86: 1.4–1.7x slower than `-i` on the Ryzen,
   2–40% faster on the M5 (Experiment 16). Look at what the AVX2 build emits.
-- Regex without a literal: closed on Linux by the lazy DFA and the
-  class-run scan (Experiment 17). Re-measure on the M5, where Experiment 16
-  had it 1.25–2x behind.
 - `\b` in the DFA: `-w` and `\b` patterns still run on the Pike VM (PCRE2
   doesn't take them either). Where the only literal is common this is the
   one measured loss left: `\b[a-z]+_[a-z]+\b` on the kernel, 2.4 s against
   ripgrep's 0.65 s (`\b[0-9a-f]{16}\b` is fine, 97 ms against 418, since
-  the class run picks the lines). An ASCII-only `\b` would be one byte of lookbehind in the state;
+  the class run picks the lines); on LLVM `clang/` on the M5, 618 ms against
+  453 (Experiment 19). An ASCII-only `\b` would be one byte of lookbehind in the state;
   ffs's Unicode `\b` needs the DFA to fall back only on non-ASCII bytes.
 - A DFA skip loop: while the DFA sits in its start state, jump with SIMD to
   the next byte that can start a match (`first`), as the Pike VM does.
